@@ -1,0 +1,65 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+env:
+  GH_TOKEN: ${{ github.token }}
+  TAG: ${{ github.ref_name }}
+
+jobs:
+  draft:
+    runs-on: ubuntu-latest
+    steps:
+      - run: gh release create "$TAG" -R "$GITHUB_REPOSITORY" --draft --verify-tag --title "$TAG" --notes ""
+
+  linux:
+    needs: draft
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: rustup toolchain install && rustup target add x86_64-unknown-linux-musl
+      - run: cargo build --release --locked --target x86_64-unknown-linux-musl
+      - name: Package
+        run: |
+          mkdir dist
+          cp target/x86_64-unknown-linux-musl/release/ferry SKILL.md herdr-plugin.toml dist/
+          sed -i "s/^version = .*/version = \"${TAG#v}\"/" dist/herdr-plugin.toml
+          tar -czf ferry-linux-x86_64.tar.gz -C dist ferry SKILL.md herdr-plugin.toml
+          gh release upload "$TAG" ferry-linux-x86_64.tar.gz
+
+  windows:
+    needs: draft
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: rustup toolchain install
+      - run: cargo build --release --locked --target x86_64-pc-windows-msvc
+      - run: |
+          cp target/x86_64-pc-windows-msvc/release/ferry.exe ferry-windows-x86_64.exe
+          gh release upload "$TAG" ferry-windows-x86_64.exe
+
+  publish:
+    needs: [linux, windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - run: |
+          gh release download "$TAG" -R "$GITHUB_REPOSITORY" -D dist
+          cd dist && sha256sum ferry-* > SHA256SUMS && cat SHA256SUMS
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-checksums: dist/SHA256SUMS
+      - run: |
+          gh release upload "$TAG" -R "$GITHUB_REPOSITORY" dist/SHA256SUMS
+          gh release edit "$TAG" -R "$GITHUB_REPOSITORY" --draft=false --latest

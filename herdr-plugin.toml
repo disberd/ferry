@@ -1,0 +1,10 @@
+id = "ferry"
+name = "ferry"
+version = "0.0.0"
+min_herdr_version = "0.9.5"
+description = "Send agent status changes to ferry serve"
+platforms = ["linux"]
+
+[[events]]
+on = "pane.agent_status_changed"
+command = ["./ferry", "hook"]
