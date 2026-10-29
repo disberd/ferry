@@ -71,7 +71,7 @@ impl Loop {
         let local = data.map(|d| {
             let p = self.root.join("local");
             fs::write(&p, d).unwrap();
-            fs::File::open(p).unwrap()
+            (fs::File::open(p).unwrap(), d.len() as u64)
         });
         let mut out = Vec::new();
         (remote::talk(&self.state, open, local, &mut out), out)
@@ -750,4 +750,115 @@ fn ssh_that_ends_before_the_hello_gives_its_last_stderr_line() {
         let crate::link::Chan::Offline { detail, .. } = chan else { panic!("{chan:?}") };
         assert_eq!(detail, "ssh ended before HELLO: Permission denied (publickey).");
     }
+}
+
+// ---- agent exit codes and socket timeouts ----
+
+const ENDED_TEXT: &str = "connection to the Workstation ended";
+
+#[test]
+fn a_socket_that_closes_with_no_end_gives_exit_3() {
+    let dir = temp_root("eof");
+    let l = UnixListener::bind(dir.join("ferry.sock")).unwrap();
+    let h = std::thread::spawn(move || drop(l.accept().unwrap()));
+    assert_eq!(remote::talk(&dir, "ls\t", None, &mut Vec::new()), Ok((OFFLINE, ENDED_TEXT.to_string())));
+    h.join().unwrap();
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn a_channel_that_ends_gives_open_requests_exit_3() {
+    for oversize in [false, true] {
+        let mut w = FakeWs::start();
+        let mut a = w.agent();
+        a.write_all(&frame(1, OPEN, b"ls\t")).unwrap();
+        assert_eq!(w.next().1, OPEN);
+        if oversize {
+            w.s.write_all(&header(CHUNK + 1, 2, DATA)).unwrap();
+        } else {
+            w.s.shutdown(std::net::Shutdown::Both).unwrap();
+        }
+        let (_, kind, p) = read_frame(&mut a).unwrap();
+        assert_eq!((kind, end_reply(&p)), (END, (OFFLINE, ENDED_TEXT.to_string())), "oversize frame: {oversize}");
+    }
+}
+
+#[test]
+fn a_takeover_gives_open_requests_exit_3_replaced() {
+    let w = FakeWs::start();
+    let mut a = w.agent();
+    a.write_all(&frame(1, OPEN, b"ls\t")).unwrap();
+    let (mut ws2, b) = UnixStream::pair().unwrap();
+    let (st, b2) = (w.state.clone(), b.try_clone().unwrap());
+    let serve2 = std::thread::spawn(move || remote::serve_on(&st, b, b2, false));
+    ws2.write_all(MAGIC).unwrap();
+    ws2.write_all(&frame(0, HELLO, format!("{PROTO}\t0\tnew-host").as_bytes())).unwrap();
+    let (_, kind, p) = read_frame(&mut a).unwrap();
+    assert_eq!((kind, end_reply(&p)), (END, (OFFLINE, "replaced by a new connection".to_string())));
+    // The new `serve` has written its HELLO before the channel closes.
+    ws2.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let mut m = [0u8; 8];
+    ws2.read_exact(&mut m).unwrap();
+    assert_eq!(read_frame(&mut ws2).unwrap().1, HELLO);
+    ws2.shutdown(std::net::Shutdown::Both).unwrap();
+    assert_eq!(serve2.join().unwrap(), 0);
+}
+
+// A push with a local file that is shorter than the declared size, or that cannot be read:
+// exit 1 at once, and `serve` cancels the stream.
+#[test]
+fn a_shorter_or_unreadable_local_file_gives_exit_1_and_a_cancel() {
+    let mut w = FakeWs::start();
+    let short = w.root.join("short");
+    fs::write(&short, b"short").unwrap();
+    let folder = w.root.join("folder");
+    fs::create_dir(&folder).unwrap();
+    for (file, declared) in [(short, 100), (folder, 10)] {
+        let open = format!("push\tx\t{declared}");
+        let r = remote::talk(&w.state, &open, Some((fs::File::open(file).unwrap(), declared)), &mut std::io::sink());
+        assert_eq!(r.unwrap().0, 1);
+        let id = loop {
+            let (id, kind, _) = w.next();
+            if kind == CANCEL {
+                break id;
+            }
+        };
+        assert_eq!(id % 2, 0, "a stream of the Remote");
+    }
+}
+
+// An agent that does not read: `serve` drops it after 1 s, sends CANCEL, and the channel goes on.
+#[test]
+fn an_agent_that_does_not_read_is_dropped_with_a_cancel() {
+    let mut w = FakeWs::start();
+    let mut a = w.agent();
+    a.write_all(&frame(1, OPEN, b"pull\tbig")).unwrap();
+    assert_eq!(w.next(), (2, OPEN, b"pull\tbig".to_vec()));
+    // More than the socket buffers hold. The writes end when `serve` has dropped the agent.
+    for _ in 0..24 {
+        w.send(2, DATA, &[7; CHUNK]);
+    }
+    assert_eq!(w.next(), (2, CANCEL, Vec::new()));
+    // The agent gets what the buffers held, then a closed socket and no END.
+    loop {
+        match read_frame(&mut a) {
+            Ok((_, kind, _)) => assert_eq!(kind, DATA),
+            Err(e) => {
+                assert!(!matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut), "{e}");
+                break;
+            }
+        }
+    }
+    let mut b = w.agent();
+    b.write_all(&frame(1, OPEN, b"ls\t")).unwrap();
+    assert_eq!(w.next(), (4, OPEN, b"ls\t".to_vec()));
+}
+
+// A request that cannot fit in one OPEN frame is a bad command line: exit 2 before any socket opens.
+#[test]
+fn an_xpath_over_one_frame_gives_exit_2() {
+    let long = "a".repeat(CHUNK);
+    assert_eq!(remote::ls(&long), 2);
+    assert_eq!(remote::pull(&long, None), 2);
+    assert_eq!(remote::push(&std::env::current_exe().unwrap().to_string_lossy(), &long), 2);
 }

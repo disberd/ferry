@@ -12,6 +12,7 @@ use crate::frame::*;
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, Read, Write};
+use std::net::Shutdown;
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -39,41 +40,72 @@ pub fn greet(proto: &str, role: &str) -> Vec<u8> {
     [MAGIC.as_slice(), &frame(0, HELLO, format!("{proto}\t{role}").as_bytes())].concat()
 }
 
-// Err(()) = no `serve` listens: the Workstation is offline.
-pub fn talk(dir: &Path, open: &str, data: Option<File>, out: &mut dyn Write) -> Result<(u8, String), ()> {
+// The two texts of exit 3 that `serve` can give. `talk` uses the first one for a socket EOF with no END.
+const ENDED: &str = "connection to the Workstation ended";
+const REPLACED: &str = "replaced by a new connection";
+
+// One frame carries the whole OPEN payload, so a longer request is a bad command line.
+fn fits(open: &str) -> bool {
+    let ok = open.len() <= CHUNK;
+    if !ok {
+        eprintln!("{}", crate::USAGE);
+    }
+    ok
+}
+
+// `data` is the file of a push and the size that OPEN declares: exactly that many bytes go out.
+// Err(()) = no `serve` listens: the Workstation is offline. A local failure gives Ok with exit 1;
+// the socket closes at the return, and `serve` sends CANCEL.
+pub fn talk(dir: &Path, open: &str, data: Option<(File, u64)>, out: &mut dyn Write) -> Result<(u8, String), ()> {
     let mut s = UnixStream::connect(dir.join("ferry.sock")).map_err(|_| ())?;
     let _ = s.write_all(&greet(PROTO, "cli"));
     let _ = s.write_all(&frame(1, OPEN, open.as_bytes()));
-    if let Some(mut f) = data {
+    if let Some((mut f, mut left)) = data {
         let mut buf = vec![0; CHUNK];
-        while let Ok(n @ 1..) = f.read(&mut buf) {
+        while left > 0 {
+            let n = left.min(CHUNK as u64) as usize;
+            if let Err(e) = f.read_exact(&mut buf[..n]) {
+                let why = if e.kind() == io::ErrorKind::UnexpectedEof { "the local file got shorter during the push".into() } else { format!("cannot read the local file: {e}") };
+                return Ok((1, why));
+            }
             if s.write_all(&frame(1, DATA, &buf[..n])).is_err() {
                 break; // `serve` went away; the read below gives the reason
             }
+            left -= n as u64;
         }
     }
     loop {
         match read_frame(&mut s) {
-            Ok((_, DATA, p)) => out.write_all(&p).map_err(|_| ())?,
+            Ok((_, DATA, p)) => {
+                if let Err(e) = out.write_all(&p) {
+                    return Ok((1, format!("cannot write the output: {e}")));
+                }
+            }
             Ok((_, END, p)) => {
                 let f = fields(&p);
                 return Ok((f[0].parse().unwrap_or(1), f.get(1).cloned().unwrap_or_default()));
             }
             Ok(_) => {}
-            Err(_) => return Ok((OFFLINE, "connection to the Workstation ended".into())),
+            Err(_) => return Ok((OFFLINE, ENDED.into())),
         }
     }
 }
 
 pub fn ls(d: &str) -> i32 {
-    show(talk(&state(), &format!("ls\t{d}"), None, &mut io::stdout()))
+    let open = format!("ls\t{d}");
+    if !fits(&open) {
+        return BAD_PATH as i32;
+    }
+    show(talk(&state(), &open, None, &mut io::stdout()), false)
 }
 
-fn show(r: Result<(u8, String), ()>) -> i32 {
+// `say`: print the text of an END 0 (`push` has one; the others print their data only).
+fn show(r: Result<(u8, String), ()>, say: bool) -> i32 {
     match r {
-        Ok((OK, m)) if m.is_empty() => 0,
         Ok((OK, m)) => {
-            println!("{m}");
+            if say && !m.is_empty() {
+                println!("{m}");
+            }
             0
         }
         Ok((c, m)) => {
@@ -88,40 +120,64 @@ fn show(r: Result<(u8, String), ()>) -> i32 {
 }
 
 pub fn pull(x: &str, dest: Option<&str>) -> i32 {
-    if dest == Some("-") {
-        return show(talk(&state(), &format!("pull\t{x}"), None, &mut io::stdout()));
+    let open = format!("pull\t{x}");
+    if !fits(&open) {
+        return BAD_PATH as i32;
     }
+    if dest == Some("-") {
+        return show(talk(&state(), &open, None, &mut io::stdout()), false);
+    }
+    pull_file(&open, x, dest).unwrap_or_else(|e| {
+        eprintln!("ferry: {e}");
+        1
+    })
+}
+
+// Pull into a file. Err = a local file that ferry cannot write; the part file is gone.
+fn pull_file(open: &str, x: &str, dest: Option<&str>) -> Result<i32, String> {
     let path = match dest {
         Some(d) => PathBuf::from(d),
         None => {
             let dir = state().join("in").join((now_ms() / 1000).to_string());
-            fs::create_dir_all(&dir).unwrap();
+            fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
             let name: String =
                 base(x).chars().map(|c| if c.is_ascii_alphanumeric() || "._-".contains(c) { c } else { '_' }).collect();
             dir.join(name)
         }
     };
     let part = path.with_extension("ferry-part");
-    let r = talk(&state(), &format!("pull\t{x}"), None, &mut File::create(&part).unwrap());
+    let mut f = File::create(&part).map_err(|e| format!("{}: {e}", part.display()))?;
+    let r = talk(&state(), open, None, &mut f);
     if matches!(r, Ok((OK, _))) {
-        fs::rename(&part, &path).unwrap();
+        if let Err(e) = fs::rename(&part, &path) {
+            let _ = fs::remove_file(&part);
+            return Err(format!("{}: {e}", path.display()));
+        }
         println!("{}", path.display());
-        return 0;
+        return Ok(0);
     }
     let _ = fs::remove_file(&part);
-    show(r)
+    Ok(show(r, false))
 }
 
 pub fn push(local: &str, x: &str) -> i32 {
-    let f = match File::open(local) {
-        Ok(f) => f,
+    let opened = match File::open(local).and_then(|f| f.metadata().map(|m| (f, m))) {
+        Ok((_, m)) if m.is_dir() => Err("is a folder".to_string()),
+        Ok((f, m)) => Ok((f, m.len())),
+        Err(e) => Err(e.to_string()),
+    };
+    let (f, size) = match opened {
+        Ok(v) => v,
         Err(e) => {
             eprintln!("ferry: {local}: {e}");
             return 1;
         }
     };
-    let size = f.metadata().unwrap().len();
-    show(talk(&state(), &format!("push\t{x}\t{size}"), Some(f), &mut io::sink()))
+    let open = format!("push\t{x}\t{size}");
+    if !fits(&open) {
+        return BAD_PATH as i32;
+    }
+    show(talk(&state(), &open, Some((f, size)), &mut io::sink()), true)
 }
 
 // ---- serve ----
@@ -148,18 +204,47 @@ impl S {
         }
     }
 
+    // One frame for the agent of stream `id`; an END also closes the stream. When the write fails
+    // (a timeout included), the frame may be half written: close the socket, and cancel the stream
+    // on the channel unless the frame was the END.
+    fn to_agent(&self, id: u32, kind: u8, p: &[u8]) {
+        let mut peers = self.peers.lock().unwrap();
+        let Some(c) = peers.get_mut(&id) else { return };
+        let r = c.write_all(&frame(id, kind, p));
+        if r.is_ok() && kind != END {
+            return;
+        }
+        let c = peers.remove(&id).unwrap();
+        drop(peers);
+        if let Err(e) = r {
+            let _ = c.shutdown(Shutdown::Both);
+            if kind != END {
+                self.out.ctrl(id, CANCEL, b"");
+            }
+            self.log(&format!("stream {id}: agent does not read ({e}), dropped"));
+        }
+    }
+
     fn finished(&self) -> bool {
         *self.done.lock().unwrap()
     }
 }
 
-// Stop all open requests with exit 3, then end `serve`. The flock goes when
+// Stop all open requests with END 3 and the text `said`, then end `serve`. The flock goes when
 // `serve` returns and the process exits.
-fn quit(s: &S, why: &str) {
+fn quit(s: &S, why: &str, said: &str) {
     s.log(&format!("exit: {why}"));
-    for (id, mut c) in s.peers.lock().unwrap().drain() {
-        let _ = c.write_all(&frame(id, END, &end(OFFLINE, why)));
-    }
+    // One thread for each agent: stuck agents cost 1 s together, not 1 s each.
+    let open: Vec<_> = s.peers.lock().unwrap().drain().collect();
+    std::thread::scope(|t| {
+        for (id, mut c) in open {
+            t.spawn(move || {
+                if c.write_all(&frame(id, END, &end(OFFLINE, said))).is_err() {
+                    let _ = c.shutdown(Shutdown::Both);
+                }
+            });
+        }
+    });
     *s.done.lock().unwrap() = true;
     s.ended.notify_all();
 }
@@ -266,7 +351,7 @@ pub fn serve_on(dir: &Path, r: impl Read + Send + 'static, mut w: impl Write + S
             std::thread::sleep(Duration::from_secs(1));
             let silent = now_ms().saturating_sub(s2.rx_ms.load(SeqCst));
             if silent > DEAD_MS {
-                quit(&s2, &format!("Workstation silent for {} s", silent / 1000));
+                quit(&s2, &format!("Workstation silent for {} s", silent / 1000), ENDED);
             }
         }
     });
@@ -286,31 +371,24 @@ fn from_workstation(s: &S, mut r: impl Read) {
     loop {
         let (id, kind, p) = match read_frame(&mut r) {
             Ok(f) => f,
-            Err(e) => return quit(s, &format!("channel: {e}")),
+            Err(e) => return quit(s, &format!("channel: {e}"), ENDED),
         };
         s.rx_ms.store(now_ms(), SeqCst);
         match kind {
             PING => {}
-            DATA => {
-                // ponytail: a slow agent stalls this reader; give each agent a queue if it matters.
-                if let Some(c) = s.peers.lock().unwrap().get_mut(&id) {
-                    let _ = c.write_all(&frame(id, DATA, &p));
-                }
-            }
-            END => {
-                if let Some(mut c) = s.peers.lock().unwrap().remove(&id) {
-                    let _ = c.write_all(&frame(id, END, &p));
-                }
-            }
+            // A slow agent stalls this reader for 1 s at most: `to_agent` drops it then.
+            DATA | END => s.to_agent(id, kind, &p),
             // A CANCEL closes a stream that the Workstation opened. `serve` holds none, so the frame is dropped.
             CANCEL => {}
-            BYE => return quit(s, &format!("BYE {}", String::from_utf8_lossy(&p))),
+            BYE => return quit(s, &format!("BYE {}", String::from_utf8_lossy(&p)), ENDED),
             k => s.log(&format!("unknown frame kind {k} on {id}")),
         }
     }
 }
 
 fn from_agent(s: &S, mut c: UnixStream) {
+    // The timeout belongs to the socket, so it covers each clone of `c` too.
+    let _ = c.set_write_timeout(Some(Duration::from_secs(1)));
     let mut m = [0u8; 8];
     if c.read_exact(&mut m).is_err() || m != *MAGIC {
         return;
@@ -333,7 +411,7 @@ fn from_agent(s: &S, mut c: UnixStream) {
             let host = String::from_utf8_lossy(&p).to_string();
             s.out.ctrl(0, BYE, format!("replaced\t{host}").as_bytes());
             std::thread::sleep(Duration::from_millis(300)); // let the writer send BYE
-            return quit(s, "replaced by a new connection");
+            return quit(s, "replaced by a new connection", REPLACED);
         }
         ("cli", OPEN) => {}
         _ => return,
