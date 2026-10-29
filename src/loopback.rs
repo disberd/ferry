@@ -862,3 +862,131 @@ fn an_xpath_over_one_frame_gives_exit_2() {
     assert_eq!(remote::pull(&long, None), 2);
     assert_eq!(remote::push(&std::env::current_exe().unwrap().to_string_lossy(), &long), 2);
 }
+
+#[test]
+fn ferry_names_are_refused_in_any_case() {
+    let l = Loop::start();
+    assert_eq!(l.push("a.txt", b"1").0, OK);
+    assert_eq!(l.push("a.txt", b"2").0, OK); // .ferry-prev/a.txt exists now
+    for x in [".FERRY-PART/x", ".Ferry-Prev/a.txt", ".ferry-prev\\a.txt", "sub/.FERRY-x", ".Ferry-x"] {
+        assert_eq!(l.push(x, b"x").0, BAD_PATH, "push {x}");
+        assert_eq!(l.pull(x).0, BAD_PATH, "pull {x}");
+        assert_eq!(l.ls(x).0, BAD_PATH, "ls {x}");
+    }
+    assert!(!l.ex.join("sub").exists());
+    assert!(leftovers(&l).is_empty());
+}
+
+#[test]
+fn refused_file_types_are_refused_in_each_folder() {
+    let l = Loop::start();
+    for x in ["a.url", "A.LNK", "x.Library-MS", "s.searchConnector-ms", "q.scf", "desktop.ini", "Desktop.INI", "sub/deep/b.URL", "sub/DESKTOP.ini"] {
+        let (code, msg) = l.push(x, b"x");
+        let name = x.rsplit('/').next().unwrap();
+        assert_eq!((code, msg), (BAD_PATH, format!("refused file type: {name}")), "{x}");
+        assert!(!l.ex.join(x).exists(), "{x}");
+    }
+    assert!(!l.ex.join("sub").exists());
+    for x in ["a.urlx", "url", "x.lnk.txt", "desktop.ini.txt", "my-desktop.ini"] {
+        assert_eq!(l.push(x, b"x").0, OK, "{x}");
+    }
+}
+
+#[test]
+fn folders_and_files_in_the_wrong_place() {
+    let l = Loop::start();
+    assert_eq!(l.push("d/in.txt", b"x").0, OK);
+    assert_eq!(l.push("f.txt", b"x").0, OK);
+
+    assert_eq!(l.push("d", b"x"), (BAD_PATH, "is a folder: d".to_string()));
+    assert_eq!(l.pull("d").0, BAD_PATH);
+    assert_eq!(l.talk("pull\td", None).0.unwrap().1, "is a folder: d");
+    assert_eq!(l.talk("ls\tf.txt", None).0.unwrap(), (BAD_PATH, "not a folder: f.txt".to_string()));
+    assert_eq!(l.push("f.txt/x.txt", b"x").0, BAD_PATH);
+    assert_eq!(l.push("f.txt/deeper/x.txt", b"x").0, BAD_PATH);
+
+    // The folder stays where it is, and no previous copy of it exists.
+    assert_eq!(fs::read(l.ex.join("d/in.txt")).unwrap(), b"x");
+    assert_eq!(fs::read(l.ex.join("f.txt")).unwrap(), b"x");
+    assert!(!l.ex.join(".ferry-prev/d").exists() && !l.ex.join(".ferry-prev/f.txt").exists());
+    assert!(leftovers(&l).is_empty());
+}
+
+#[test]
+fn ls_hides_ferry_names_and_office_owner_files() {
+    let l = Loop::start();
+    for p in [".FERRY-x", ".Ferry-part2", "~$book.xlsx", "sub/~$doc.docx", "sub/.ferry-y", "~a.txt", "sub/keep.txt", "a.txt"] {
+        let p = l.ex.join(p);
+        fs::create_dir_all(p.parent().unwrap()).unwrap();
+        fs::write(p, b"x").unwrap();
+    }
+    let names = |d: &str| -> Vec<String> {
+        l.ls(d).1.lines().map(|r| r.split('\t').nth(2).unwrap().to_string()).collect()
+    };
+    assert_eq!(names(""), ["a.txt", "sub/", "~a.txt"]);
+    assert_eq!(names("sub"), ["sub/keep.txt"]);
+}
+
+#[test]
+fn a_pull_over_the_cap_gets_exit_5() {
+    let l = Loop::start();
+    let f = fs::File::create(l.ex.join("big.bin")).unwrap();
+    f.set_len(CAP + 1).unwrap(); // sparse
+    assert_eq!(l.pull("big.bin"), (TOO_LARGE, Vec::new()));
+}
+
+#[test]
+fn a_push_needs_2_gib_free_after_the_write() {
+    const GIB: u64 = 1 << 30;
+    let l = Loop::start();
+    let free = |n: u64| exchange::FREE.lock().unwrap().insert(l.ex.clone(), n);
+    free(2 * GIB + 4);
+    assert_eq!(l.push("ok.txt", b"1234").0, OK, "exactly 2 GiB stay free");
+    free(2 * GIB + 3);
+    let (code, msg) = l.push("low.txt", b"1234");
+    assert_eq!((code, msg), (TOO_LARGE, "Workstation disk low: 2 GiB free".to_string()));
+    assert!(!l.ex.join("low.txt").exists());
+    free(GIB + GIB / 2);
+    assert_eq!(l.push("low.txt", b"").1, "Workstation disk low: 1 GiB free");
+    assert!(leftovers(&l).is_empty());
+    free(u64::MAX);
+    assert_eq!(l.push("low.txt", b"1").0, OK);
+    exchange::FREE.lock().unwrap().remove(&l.ex);
+}
+
+// A sharing violation does not exist on Linux. A folder that refuses the move of
+// its entry gives the same error kind (access denied), which Windows also maps to exit 4.
+#[test]
+fn a_file_in_use_gives_exit_4_and_stays_as_it_was() {
+    let l = Loop::start();
+    assert_eq!(l.push("sub/a.txt", b"old").0, OK);
+    let sub = l.ex.join("sub");
+    fs::set_permissions(&sub, fs::Permissions::from_mode(0o500)).unwrap();
+    // A user with the right to write anyway (root) cannot make the lock.
+    let can_write = fs::write(sub.join("probe"), b"").is_ok();
+    let r = l.push("sub/a.txt", b"new");
+    let (pull_code, _) = l.pull("sub/a.txt");
+    fs::set_permissions(&sub, fs::Permissions::from_mode(0o700)).unwrap();
+    if can_write {
+        return;
+    }
+    assert_eq!(r, (IN_USE, "in use: sub/a.txt".to_string()));
+    assert_eq!(pull_code, OK);
+    assert_eq!(fs::read(sub.join("a.txt")).unwrap(), b"old");
+    assert!(leftovers(&l).is_empty());
+
+    // A file that the Workstation cannot open is in use for a pull.
+    fs::set_permissions(sub.join("a.txt"), fs::Permissions::from_mode(0)).unwrap();
+    assert_eq!(l.talk("pull\tsub/a.txt", None).0.unwrap(), (IN_USE, "in use: sub/a.txt".to_string()));
+}
+
+#[test]
+fn a_push_without_a_valid_size_changes_nothing() {
+    let l = Loop::start();
+    for open in ["push\ta.txt", "push\ta.txt\tabc", "push\ta.txt\t-1", "push", "pull"] {
+        let code = l.talk(open, None).0.unwrap().0;
+        assert_ne!(code, OK, "{open}");
+    }
+    assert!(!l.ex.join("a.txt").exists());
+    assert!(leftovers(&l).is_empty());
+}

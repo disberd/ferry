@@ -60,6 +60,13 @@ pub fn hide(p: &std::path::Path) {
     unsafe { SetFileAttributesW(wide(&p.display().to_string()).as_ptr(), FILE_ATTRIBUTE_HIDDEN) };
 }
 
+// Marks a file as from the Internet zone. The stream stays when the file is renamed.
+pub fn mark_of_the_web(p: &std::path::Path) -> io::Result<()> {
+    let mut s = p.as_os_str().to_owned();
+    s.push(":Zone.Identifier");
+    fs::write(s, "[ZoneTransfer]\r\nZoneId=3\r\n")
+}
+
 fn dir() -> PathBuf {
     PathBuf::from(std::env::var("LOCALAPPDATA").expect("LOCALAPPDATA is not set")).join("ferry")
 }

@@ -26,6 +26,8 @@ use std::time::{Duration, Instant};
 
 const PREV: &str = ".ferry-prev";
 const PART: &str = ".ferry-part";
+// A push leaves at least this much free on the Workstation disk.
+const FLOOR: u64 = 2 << 30;
 
 struct Push {
     tmp: PathBuf,
@@ -222,13 +224,56 @@ fn resolve(ex: &Path, x: &str) -> Result<PathBuf, String> {
             || part.ends_with(['.', ' '])
             || reserved
             || (i == 0 && part.eq_ignore_ascii_case(PREV))
-            || part.starts_with(".ferry-")
+            || ferry_name(part)
         {
             return Err(format!("bad path: {x}"));
         }
         p.push(part);
     }
     Ok(p)
+}
+
+// A name that starts with `.ferry-`, in any case: the folders and part files of ferry.
+fn ferry_name(s: &str) -> bool {
+    s.to_ascii_lowercase().starts_with(".ferry-")
+}
+
+// Explorer reads these when it shows a folder, so an agent must not write them.
+fn refused(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    n == "desktop.ini" || [".url", ".lnk", ".library-ms", ".searchconnector-ms", ".scf"].iter().any(|e| n.ends_with(e))
+}
+
+// Free bytes on the volume of the Exchange folder. The fail-open value is for a call that fails.
+#[cfg(windows)]
+fn free_bytes(ex: &Path) -> u64 {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetDiskFreeSpaceExW(dir: *const u16, avail: *mut u64, total: *mut u64, free: *mut u64) -> i32;
+    }
+    let (mut avail, mut total, mut free) = (0u64, 0u64, 0u64);
+    let ok = unsafe { GetDiskFreeSpaceExW(crate::windows::wide(&ex.display().to_string()).as_ptr(), &mut avail, &mut total, &mut free) };
+    if ok == 0 {
+        log(&format!("free space of {}: error {}", ex.display(), crate::windows::last_error()));
+        return u64::MAX;
+    }
+    avail
+}
+
+// No volume query off Windows: the tests set the free space for one Exchange folder.
+#[cfg(all(not(windows), test))]
+pub static FREE: Mutex<std::collections::BTreeMap<PathBuf, u64>> = Mutex::new(std::collections::BTreeMap::new());
+
+#[cfg(not(windows))]
+fn free_bytes(ex: &Path) -> u64 {
+    #[cfg(test)]
+    {
+        if let Some(n) = FREE.lock().unwrap().get(ex) {
+            return *n;
+        }
+    }
+    let _ = ex;
+    u64::MAX
 }
 
 fn in_use(e: &io::Error) -> bool {
@@ -238,24 +283,40 @@ fn in_use(e: &io::Error) -> bool {
 
 fn open(c: &Arc<C>, id: u32, f: Vec<String>) {
     log(&format!("{id}: OPEN {}", f.join(" ")));
-    let path = match resolve(&c.ex, f.get(1).map_or("", |s| s.as_str())) {
+    let rel = f.get(1).cloned().unwrap_or_default();
+    let path = match resolve(&c.ex, &rel) {
         Ok(p) => p,
         Err(e) => return reply(c, id, BAD_PATH, &e),
     };
     let c = c.clone();
     match f[0].as_str() {
-        "ls" => answer(&c, id, move |c| ls(c, id, &path)),
-        "pull" => answer(&c, id, move |c| pull(c, id, &path)),
+        "ls" => answer(&c, id, move |c| ls(c, id, &path, &rel)),
+        "pull" => answer(&c, id, move |c| pull(c, id, &path, &rel)),
         "push" => {
-            let size: u64 = f.get(2).and_then(|s| s.parse().ok()).unwrap_or(0);
-            if size > CAP {
-                return reply(&c, id, TOO_LARGE, &format!("{size} B is over the cap of {CAP} B"));
-            }
+            let Some(size) = f.get(2).and_then(|s| s.parse::<u64>().ok()) else {
+                return reply(&c, id, 1, "bad size");
+            };
             if path == c.ex {
                 return reply(&c, id, BAD_PATH, "push needs a file name");
             }
             let dir = path.parent().unwrap();
             let name = path.file_name().unwrap().to_string_lossy().to_string();
+            if refused(&name) {
+                return reply(&c, id, BAD_PATH, &format!("refused file type: {name}"));
+            }
+            if size > CAP {
+                return reply(&c, id, TOO_LARGE, &format!("{size} B is over the cap of {CAP} B"));
+            }
+            let free = free_bytes(&c.ex);
+            if free.saturating_sub(size) < FLOOR {
+                return reply(&c, id, TOO_LARGE, &format!("Workstation disk low: {} GiB free", free >> 30));
+            }
+            if path.is_dir() {
+                return reply(&c, id, BAD_PATH, &format!("is a folder: {rel}"));
+            }
+            if dir.ancestors().take_while(|a| *a != c.ex).any(|a| a.is_file()) {
+                return reply(&c, id, BAD_PATH, &format!("a parent of {rel} is a file"));
+            }
             if let Err(e) = fs::create_dir_all(dir).and_then(|_| fs::create_dir_all(c.ex.join(PART))) {
                 return reply(&c, id, 1, &e.to_string());
             }
@@ -266,7 +327,7 @@ fn open(c: &Arc<C>, id: u32, f: Vec<String>) {
             };
             let push = Push {
                 tmp,
-                rel: f[1].clone(),
+                rel,
                 target: path,
                 file: Some(file),
                 left: size,
@@ -292,15 +353,21 @@ fn answer(c: &Arc<C>, id: u32, f: impl FnOnce(&C) + Send + 'static) {
     });
 }
 
-fn ls(c: &C, id: u32, dir: &Path) {
+fn ls(c: &C, id: u32, dir: &Path, rel_dir: &str) {
+    if dir.is_file() {
+        return reply(c, id, BAD_PATH, &format!("not a folder: {rel_dir}"));
+    }
     let rd = match fs::read_dir(dir) {
         Ok(rd) => rd,
-        Err(e) => return reply(c, id, BAD_PATH, &format!("{}: {e}", dir.display())),
+        Err(e) => return reply(c, id, BAD_PATH, &format!("{rel_dir}: {e}")),
     };
     let rel = dir.strip_prefix(&c.ex).unwrap().to_string_lossy().replace('\\', "/");
     let mut lines: Vec<String> = rd
         .filter_map(Result::ok)
-        .filter(|e| !e.file_name().to_string_lossy().starts_with(".ferry-"))
+        .filter(|e| {
+            let n = e.file_name().to_string_lossy().to_string();
+            !ferry_name(&n) && !n.starts_with("~$")
+        })
         .map(|e| {
             let m = e.metadata().unwrap();
             let t = m.modified().unwrap().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
@@ -316,11 +383,14 @@ fn ls(c: &C, id: u32, dir: &Path) {
     reply(c, id, OK, "");
 }
 
-fn pull(c: &C, id: u32, path: &Path) {
+fn pull(c: &C, id: u32, path: &Path, rel: &str) {
+    if path.is_dir() {
+        return reply(c, id, BAD_PATH, &format!("is a folder: {rel}"));
+    }
     let mut f = match File::open(path) {
         Ok(f) => f,
-        Err(e) if in_use(&e) => return reply(c, id, IN_USE, &format!("in use: {}", path.display())),
-        Err(e) => return reply(c, id, BAD_PATH, &format!("{}: {e}", path.display())),
+        Err(e) if in_use(&e) => return reply(c, id, IN_USE, &format!("in use: {rel}")),
+        Err(e) => return reply(c, id, BAD_PATH, &format!("{rel}: {e}")),
     };
     let size = f.metadata().unwrap().len();
     if size > CAP {
@@ -376,15 +446,21 @@ fn discard(p: Push) {
 fn finish(c: &C, id: u32, mut p: Push) {
     p.file = None; // Windows renames only a closed file
     let secs = p.t.elapsed().as_secs_f64();
+    #[cfg(windows)]
+    {
+        if let Err(e) = crate::windows::mark_of_the_web(&p.tmp) {
+            log(&format!("Zone.Identifier of {}: {e}", p.rel));
+        }
+    }
     let r = place(c, &p);
     let (code, msg) = match r {
-        Ok(m) => (OK, m),
+        Ok(m) => (OK, format!("{m} ({secs:.1} s)")),
         Err((code, m)) => {
             let _ = fs::remove_file(&p.tmp);
             (code, m)
         }
     };
-    reply(c, id, code, &format!("{msg} ({:.1} s)", secs));
+    reply(c, id, code, &msg);
     if code == OK {
         play(Sound::Arrival);
     }
@@ -398,7 +474,10 @@ fn place(c: &C, p: &Push) -> Result<String, (u8, String)> {
         fs::create_dir_all(prev.parent().unwrap()).map_err(|e| (1, e.to_string()))?;
         match fs::rename(&p.target, &prev) {
             Ok(()) => {}
-            Err(e) if in_use(&e) => return Err((IN_USE, format!("in use: {} ({e})", p.rel))),
+            Err(e) if in_use(&e) => {
+                log(&format!("{}: {e}", p.rel));
+                return Err((IN_USE, format!("in use: {}", p.rel)));
+            }
             Err(e) => return Err((1, e.to_string())),
         }
     }
