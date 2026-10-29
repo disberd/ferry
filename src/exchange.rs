@@ -7,10 +7,11 @@
 // on Linux, where the tests run it against `remote::serve_on`.
 
 use crate::frame::*;
+use crate::sounds::{play, Sound};
 #[cfg(windows)]
-use crate::windows::{hide, log, sound, ssh};
+use crate::windows::{hide, log, ssh};
 #[cfg(not(windows))]
-use crate::stub::{log, sound};
+use crate::stub::log;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, Read, Write};
@@ -345,7 +346,7 @@ fn finish(c: &C, id: u32, mut p: Push) {
     };
     reply(c, id, code, &format!("{msg} ({:.1} s)", secs));
     if code == OK {
-        sound("Notification.Reminder");
+        play(Sound::Arrival);
     }
 }
 

@@ -7,6 +7,8 @@
 #![cfg_attr(not(any(windows, test)), allow(dead_code))]
 
 mod frame;
+#[cfg_attr(not(windows), allow(dead_code))]
+mod sounds;
 #[cfg(unix)]
 mod hkserve;
 #[cfg(unix)]

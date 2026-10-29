@@ -24,10 +24,6 @@ extern "system" {
     fn QueryFullProcessImageNameW(h: *mut c_void, flags: u32, name: *mut u16, len: *mut u32) -> i32;
     fn SetFileAttributesW(path: *const u16, attrs: u32) -> i32;
 }
-#[link(name = "winmm")]
-extern "system" {
-    fn PlaySoundW(sound: *const u16, hmod: *mut c_void, flags: u32) -> i32;
-}
 
 const DETACHED_PROCESS: u32 = 0x8;
 const CREATE_NEW_PROCESS_GROUP: u32 = 0x200;
@@ -42,12 +38,6 @@ pub fn wide(s: &str) -> Vec<u16> {
 
 pub fn last_error() -> u32 {
     unsafe { GetLastError() }
-}
-
-pub fn sound(alias: &str) {
-    const SND_ALIAS: u32 = 0x10000;
-    const SND_ASYNC: u32 = 0x1;
-    unsafe { PlaySoundW(wide(alias).as_ptr(), std::ptr::null_mut(), SND_ALIAS | SND_ASYNC) };
 }
 
 pub fn hide(p: &std::path::Path) {

@@ -1,0 +1,10 @@
+ferry
+Copyright the ferry contributors. Licensed under the Apache License 2.0 (see LICENSE).
+
+This product includes two sounds from herdr (https://github.com/herdrdev/herdr),
+licensed under the Apache License 2.0:
+
+  sounds/blocked-a.wav  from assets/sounds/request.mp3
+  sounds/done-a.wav     from assets/sounds/done.mp3
+
+ferry converted both files to 22.05 kHz mono 16-bit PCM WAV.

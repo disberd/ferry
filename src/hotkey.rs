@@ -6,7 +6,8 @@
 // paths go to the clipboard. Every step is logged.
 
 use std::ffi::c_void;
-use crate::windows::{last_error, log, sound, ssh, wide};
+use crate::sounds::{play, Sound};
+use crate::windows::{last_error, log, ssh, wide};
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, ChildStdout};
@@ -186,20 +187,20 @@ fn on_hotkey(conn: &mut Option<Conn>, alias: &str) {
         Ok(c) => c,
         Err(e) => {
             log(&format!("  FAIL: {e}"));
-            return sound("SystemHand");
+            return play(Sound::Error);
         }
     };
     log(&format!("  clipboard formats: {}", formats.join(", ")));
     let items: Vec<(String, Vec<u8>)> = match clip {
         Clip::Nothing => {
             log("  nothing to send (no HDROP, no PNG)");
-            return sound("SystemHand");
+            return play(Sound::Error);
         }
         Clip::Png(data) => vec![("screenshot.png".into(), data)],
         Clip::Files(files) => {
             if let Some(dir) = files.iter().find(|p| p.is_dir()) {
                 log(&format!("  REFUSED: folder {}", dir.display()));
-                return sound("SystemHand");
+                return play(Sound::Error);
             }
             let mut v = Vec::new();
             for p in &files {
@@ -207,7 +208,7 @@ fn on_hotkey(conn: &mut Option<Conn>, alias: &str) {
                     Ok(d) => v.push((p.file_name().unwrap().to_string_lossy().into_owned(), d)),
                     Err(e) => {
                         log(&format!("  FAIL: read {}: {e}", p.display()));
-                        return sound("SystemHand");
+                        return play(Sound::Error);
                     }
                 }
             }
@@ -229,7 +230,7 @@ fn on_hotkey(conn: &mut Option<Conn>, alias: &str) {
         Err(e) => {
             *conn = None;
             log(&format!("  FAIL: {e}"));
-            return sound("SystemHand");
+            return play(Sound::Error);
         }
     };
     let total = t.elapsed().as_millis();
@@ -244,11 +245,11 @@ fn on_hotkey(conn: &mut Option<Conn>, alias: &str) {
             log(&format!("  NO PASTE: {reason}"));
             log(&format!("  paths on Workstation clipboard ({}): {paths}", if ok { "ok" } else { "FAILED" }));
             log(&format!("  hotkey to reply {total} ms, of which serve {ms} ms"));
-            sound("Notification.Reminder");
+            play(Sound::Clip);
         }
         _ => {
             log(&format!("  FAIL: bad reply {reply:?}"));
-            sound("SystemHand");
+            play(Sound::Error);
         }
     }
 }
