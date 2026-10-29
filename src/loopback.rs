@@ -990,3 +990,357 @@ fn a_push_without_a_valid_size_changes_nothing() {
     assert!(!l.ex.join("a.txt").exists());
     assert!(leftovers(&l).is_empty());
 }
+
+// ---- hotkey press ----
+
+use crate::exchange::{Item, Outcome, Src};
+use std::sync::{Arc, Mutex};
+
+// The Landing folder entries under a state folder.
+fn entries(state: &Path) -> Vec<PathBuf> {
+    let mut v: Vec<PathBuf> = fs::read_dir(state.join("in")).map(|d| d.map(|e| e.unwrap().path()).collect()).unwrap_or_default();
+    v.sort();
+    v
+}
+
+fn names(dir: &Path) -> Vec<String> {
+    let mut v: Vec<String> = fs::read_dir(dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+    v.sort();
+    v
+}
+
+// `YYYYmmdd-HHMMSS`, with `-2`, `-3` and so on when the name existed.
+fn is_stamp(name: &str) -> bool {
+    let b = name.as_bytes();
+    b.len() >= 15 && b[8] == b'-' && b[..8].iter().chain(&b[9..15]).all(u8::is_ascii_digit) && (b.len() == 15 || b[15] == b'-')
+}
+
+// A press on a full loop. The second value is the text that the press put on the clipboard.
+fn pressed(l: &Loop, items: &[Item]) -> (Outcome, Option<String>) {
+    wait_for("channel", || exchange::connected(&l.ex));
+    let mut clip = None;
+    let out = exchange::press(&l.ex, items, |t| {
+        clip = Some(t.to_string());
+        true
+    });
+    (out, clip)
+}
+
+fn clip_paths(out: Outcome) -> Vec<String> {
+    let Outcome::Clip(paths) = out else { panic!("{out:?}") };
+    paths
+}
+
+#[test]
+fn a_press_lands_its_files_in_one_entry_and_gives_the_paths_for_the_clipboard() {
+    let l = Loop::start();
+    let big = bytes(3 * CHUNK + 5);
+    let (f, e) = (l.root.join("big.bin"), l.root.join("empty.txt"));
+    fs::write(&f, &big).unwrap();
+    fs::write(&e, b"").unwrap();
+    let items = [Item::file(&f).unwrap(), Item::mem("shot.png", b"png".to_vec()), Item::file(&e).unwrap()];
+    let (out, clip) = pressed(&l, &items);
+    let paths = clip_paths(out);
+    assert_eq!(clip.as_deref(), Some(paths.join(" ").as_str()));
+    let dirs = entries(&l.state);
+    assert_eq!(dirs.len(), 1);
+    assert!(is_stamp(dirs[0].file_name().unwrap().to_str().unwrap()), "{dirs:?}");
+    assert_eq!(fs::metadata(&dirs[0]).unwrap().permissions().mode() & 0o777, 0o700);
+    assert_eq!(paths, ["big.bin", "shot.png", "empty.txt"].map(|n| dirs[0].join(n).display().to_string()));
+    assert_eq!(fs::read(&paths[0]).unwrap(), big);
+    assert_eq!(fs::read(&paths[1]).unwrap(), b"png");
+    assert_eq!(fs::read(&paths[2]).unwrap(), b"");
+    assert_eq!(names(&dirs[0]).len(), 3, "a part file is left");
+}
+
+#[test]
+fn each_press_makes_its_own_entry() {
+    let l = Loop::start();
+    for _ in 0..2 {
+        clip_paths(pressed(&l, &[Item::mem("a.txt", b"1".to_vec())]).0);
+    }
+    let dirs = entries(&l.state);
+    assert_eq!(dirs.len(), 2);
+    assert!(dirs.iter().all(|d| is_stamp(d.file_name().unwrap().to_str().unwrap()) && names(d) == ["a.txt"]), "{dirs:?}");
+}
+
+#[test]
+fn names_keep_safe_characters_and_a_repeat_gets_a_number_before_the_extension() {
+    let l = Loop::start();
+    let items = ["a b.txt", "a?b.txt", ".hid", ".hid", "x.tar.gz", "x.tar.gz", "..", "é.txt", "ü.txt"].map(|n| Item::mem(n, b"1".to_vec()));
+    let paths = clip_paths(pressed(&l, &items).0);
+    let got: Vec<&str> = paths.iter().map(|p| p.rsplit('/').next().unwrap()).collect();
+    assert_eq!(got, ["a_b.txt", "a_b-2.txt", ".hid", ".hid-2", "x.tar.gz", "x.tar-2.gz", "_", "_.txt", "_-2.txt"]);
+}
+
+#[test]
+fn a_new_entry_deletes_entries_older_than_7_days() {
+    let l = Loop::start_with(|state| {
+        for (name, days) in [("old", 8), ("recent", 6)] {
+            let d = state.join("in").join(name);
+            fs::create_dir_all(&d).unwrap();
+            fs::File::open(&d).unwrap().set_modified(std::time::SystemTime::now() - Duration::from_secs(days * 86400)).unwrap();
+        }
+    });
+    clip_paths(pressed(&l, &[Item::mem("a.txt", b"1".to_vec())]).0);
+    let left: Vec<String> = entries(&l.state).iter().map(|d| d.file_name().unwrap().to_string_lossy().into_owned()).collect();
+    assert!(left.len() == 2 && left.contains(&"recent".to_string()) && !left.contains(&"old".to_string()), "{left:?}");
+}
+
+#[test]
+fn a_pull_with_no_local_path_lands_in_a_new_entry_with_a_safe_name() {
+    let l = Loop::start();
+    fs::write(l.ex.join("my file (1).txt"), b"data").unwrap();
+    assert_eq!(remote::pull_in(&l.state, "my file (1).txt", None), 0);
+    assert_eq!(remote::pull_in(&l.state, "my file (1).txt", None), 0);
+    let dirs = entries(&l.state);
+    assert_eq!(dirs.len(), 2);
+    for d in &dirs {
+        assert!(is_stamp(d.file_name().unwrap().to_str().unwrap()), "{d:?}");
+        assert_eq!(names(d), ["my_file__1_.txt"]);
+        assert_eq!(fs::read(d.join("my_file__1_.txt")).unwrap(), b"data");
+    }
+}
+
+#[test]
+fn a_press_of_100_files_with_the_longest_names_fits_in_one_open_and_one_reply() {
+    let l = Loop::start();
+    let items: Vec<Item> = (0..100).map(|i| Item::mem(&format!("{i:03}{}.txt", "n".repeat(248)), vec![i as u8])).collect();
+    let paths = clip_paths(pressed(&l, &items).0);
+    assert_eq!(paths.len(), 100);
+    // The Remote cuts a name to 240 bytes and keeps its extension.
+    assert!(paths.iter().all(|p| p.rsplit('/').next().unwrap().len() == 240 && p.ends_with(".txt")));
+    assert!(paths.iter().enumerate().all(|(i, p)| fs::read(p).unwrap() == [i as u8]));
+}
+
+#[test]
+fn a_press_over_the_limits_is_refused_and_sends_nothing() {
+    let mut r = FakeRemote::start();
+    wait_for("channel", || exchange::connected(&r.ex));
+    let many: Vec<Item> = (0..101).map(|i| Item::mem(&format!("f{i}"), vec![])).collect();
+    let long: Vec<Item> = (0..100).map(|i| Item::mem(&format!("{i}{}", "n".repeat(700)), vec![])).collect();
+    for items in [many, long] {
+        let out = exchange::press(&r.ex, &items, |_| panic!("clipboard"));
+        assert!(matches!(&out, Outcome::Failed(w) if w.starts_with("press refused")), "{out:?}");
+    }
+    r.quiet();
+}
+
+#[test]
+fn a_press_with_no_channel_fails() {
+    let out = exchange::press(Path::new("/no-such-exchange-folder"), &[Item::mem("a", vec![1])], |_| panic!("clipboard"));
+    assert!(matches!(out, Outcome::Failed(_)));
+}
+
+#[test]
+fn a_press_over_the_cap_gets_end_5_and_nothing_lands() {
+    let l = Loop::start();
+    let big = l.root.join("big.bin");
+    fs::File::create(&big).unwrap().set_len(CAP + 1).unwrap(); // sparse
+    let (out, clip) = pressed(&l, &[Item::file(&big).unwrap()]);
+    assert!(matches!(&out, Outcome::Failed(w) if w.contains("END 5")), "{out:?}");
+    assert!(clip.is_none() && entries(&l.state).is_empty());
+}
+
+// A scripted Workstation opens presses on `serve`.
+fn ws_open(w: &mut FakeWs, id: u32, files: &[(&str, u64)]) {
+    let mut open = format!("hotkey\t{}", files.len());
+    for (n, s) in files {
+        open += &format!("\t{n}\t{s}");
+    }
+    w.send(id, OPEN, open.as_bytes());
+}
+
+// The next frame from `serve` must be the END of stream `id`.
+fn ws_end(w: &mut FakeWs, id: u32) -> Reply {
+    let (i, kind, p) = w.next();
+    assert_eq!((i, kind), (id, END));
+    end_reply(&p)
+}
+
+#[test]
+fn serve_splits_the_bytes_by_the_declared_sizes_and_renames_after_the_last_byte() {
+    let mut w = FakeWs::start();
+    ws_open(&mut w, 1, &[("a", 2), ("z1", 0), ("b", 3), ("z2", 0)]);
+    wait_for("entry", || entries(&w.state).len() == 1);
+    let dir = entries(&w.state).remove(0);
+    w.send(1, DATA, b"x");
+    wait_for("part file", || fs::read(dir.join("a.ferry-part")).is_ok_and(|d| d == b"x"));
+    assert_eq!(names(&dir), ["a.ferry-part"]);
+    // One frame holds the end of `a`, all of `b`, and the empty files between and after them.
+    w.send(1, DATA, b"yBCD");
+    let (code, text) = ws_end(&mut w, 1);
+    assert_eq!(code, OK);
+    let paths: Vec<&str> = text.strip_prefix("clip ").unwrap().split(' ').collect();
+    assert_eq!(paths, ["a", "z1", "b", "z2"].map(|n| dir.join(n).display().to_string()));
+    assert_eq!(names(&dir), ["a", "b", "z1", "z2"]);
+    let read = |i: usize| fs::read(paths[i]).unwrap();
+    assert_eq!((read(0), read(1), read(2)), (b"xy".to_vec(), vec![], b"BCD".to_vec()));
+
+    // A press of empty files completes at OPEN.
+    ws_open(&mut w, 3, &[("empty", 0)]);
+    assert_eq!(ws_end(&mut w, 3).0, OK);
+    assert_eq!(entries(&w.state).len(), 2);
+}
+
+#[test]
+fn serve_refuses_a_bad_or_over_cap_press_at_open_and_drops_its_data() {
+    let mut w = FakeWs::start();
+    for (id, open) in [(1, "hotkey\t2\ta\t1"), (3, "hotkey\t0"), (5, "hotkey\t1\ta\tx"), (7, "other\t1\ta\t1")] {
+        w.send(id, OPEN, open.as_bytes());
+        assert_eq!(ws_end(&mut w, id).0, 1, "{open}");
+    }
+    ws_open(&mut w, 9, &[("a", CAP / 2 + 1), ("b", CAP / 2)]);
+    assert_eq!(ws_end(&mut w, 9).0, TOO_LARGE);
+    ws_open(&mut w, 11, &[("a", u64::MAX), ("b", 1)]);
+    assert_eq!(ws_end(&mut w, 11).0, TOO_LARGE);
+    w.send(9, DATA, b"late");
+    w.send(11, CANCEL, b"");
+    assert!(entries(&w.state).is_empty());
+
+    // A sum of exactly the cap is fine. A CANCEL then deletes the entry, and `serve` sends no frame.
+    ws_open(&mut w, 13, &[("big", CAP)]);
+    wait_for("entry", || entries(&w.state).len() == 1);
+    w.send(13, CANCEL, b"");
+    wait_for("entry deleted", || entries(&w.state).is_empty());
+    ws_open(&mut w, 15, &[("c", 0)]);
+    assert_eq!(ws_end(&mut w, 15).0, OK);
+}
+
+#[test]
+fn serve_ends_a_press_that_gets_more_data_than_declared_and_deletes_the_entry() {
+    let mut w = FakeWs::start();
+    ws_open(&mut w, 1, &[("a", 3)]);
+    w.send(1, DATA, b"abcd");
+    assert_eq!(ws_end(&mut w, 1).0, 1);
+    assert!(entries(&w.state).is_empty());
+    w.send(1, DATA, b"x"); // the stream is closed: no reply
+    ws_open(&mut w, 3, &[("c", 0)]);
+    assert_eq!(ws_end(&mut w, 3).0, OK);
+}
+
+#[test]
+fn the_end_of_the_channel_deletes_the_entry_of_a_press_in_progress() {
+    let mut w = FakeWs::start();
+    ws_open(&mut w, 1, &[("a", 10)]);
+    w.send(1, DATA, b"abc");
+    wait_for("part file", || entries(&w.state).first().is_some_and(|d| fs::read(d.join("a.ferry-part")).is_ok_and(|b| b == b"abc")));
+    w.s.shutdown(std::net::Shutdown::Both).unwrap();
+    w.serve.take().unwrap().join().unwrap();
+    assert!(entries(&w.state).is_empty());
+}
+
+// One press of one small file against a scripted Remote that answers with END `code` and `text`.
+// The second value is the text that the press put on the clipboard.
+fn answered(code: u8, text: &str) -> (Outcome, Option<String>) {
+    let mut r = FakeRemote::start();
+    let ex = r.ex.clone();
+    let clip = Arc::new(Mutex::new(None));
+    let clip2 = clip.clone();
+    let h = std::thread::spawn(move || {
+        wait_for("channel", || exchange::connected(&ex));
+        exchange::press(&ex, &[Item::mem("a.png", b"abc".to_vec())], move |t| {
+            *clip2.lock().unwrap() = Some(t.to_string());
+            true
+        })
+    });
+    let (id, kind, p) = r.next();
+    assert_eq!((id, kind, p.as_slice()), (1, OPEN, &b"hotkey\t1\ta.png\t3"[..]));
+    assert_eq!(r.next(), (1, DATA, b"abc".to_vec()));
+    r.send(1, END, &end(code, text));
+    let out = h.join().unwrap();
+    let clip = clip.lock().unwrap().clone();
+    (out, clip)
+}
+
+#[test]
+fn a_clip_reply_reaches_the_clipboard_only_when_each_path_passes_the_check() {
+    let good = "/home/u/.local/state/ferry/in/20261029-101010/a.png /x/b-2.txt";
+    let (out, clip) = answered(OK, &format!("clip {good}"));
+    assert_eq!(out, Outcome::Clip(good.split(' ').map(String::from).collect()));
+    assert_eq!(clip.as_deref(), Some(good));
+    for bad in [
+        "clip ", "clip relative/a", "clip /", "clip /a b", "clip /a;rm", "clip /a$(id)", "clip /a`id`", "clip /a'b", "clip /a\"b",
+        "clip /a /c|d", "clip /a\\b", "clip /é", "clip  /a", "clip /a /b ", "clip", "other /a",
+    ] {
+        let (out, clip) = answered(OK, bad);
+        assert!(matches!(out, Outcome::Failed(_)), "{bad:?}: {out:?}");
+        assert!(clip.is_none(), "{bad:?}");
+    }
+}
+
+#[test]
+fn an_end_with_a_code_fails_the_press_and_a_pasted_reply_leaves_the_clipboard() {
+    for (code, text) in [(TOO_LARGE, "too large"), (1, "x"), (3, "gone")] {
+        let (out, clip) = answered(code, text);
+        assert!(matches!(out, Outcome::Failed(_)) && clip.is_none(), "{code}: {out:?}");
+    }
+    assert_eq!(answered(OK, "pasted"), (Outcome::Pasted, None));
+}
+
+#[test]
+fn a_file_that_is_shorter_or_unreadable_gives_cancel_and_the_error() {
+    let mut r = FakeRemote::start();
+    wait_for("channel", || exchange::connected(&r.ex));
+    let short = r.root.join("short");
+    fs::write(&short, b"abc").unwrap();
+    for (n, (path, size)) in [(short, 10), (r.root.join("gone"), 5)].into_iter().enumerate() {
+        let id = 1 + 2 * n as u32;
+        let item = Item { name: "f.bin".into(), size, src: Src::File(path) };
+        let out = exchange::press(&r.ex, &[item], |_| panic!("clipboard"));
+        assert!(matches!(out, Outcome::Failed(_)), "{out:?}");
+        // OPEN, then maybe DATA, then CANCEL, and no END.
+        let (i, kind, _) = r.next();
+        assert_eq!((i, kind), (id, OPEN));
+        loop {
+            let (i, kind, _) = r.next();
+            assert_eq!(i, id);
+            match kind {
+                DATA => {}
+                CANCEL => break,
+                k => panic!("kind {k}"),
+            }
+        }
+    }
+    r.quiet();
+}
+
+#[test]
+fn serve_deletes_the_entry_of_a_press_that_the_workstation_cancels() {
+    let l = Loop::start();
+    let short = l.root.join("short");
+    fs::write(&short, b"abc").unwrap();
+    let item = Item { name: "f.bin".into(), size: 10, src: Src::File(short) };
+    let (out, clip) = pressed(&l, &[item]);
+    assert!(matches!(out, Outcome::Failed(_)) && clip.is_none(), "{out:?}");
+    // The press ended at its CANCEL. `serve` handles OPEN, DATA and CANCEL in order, so a press
+    // that completes after the CANCEL finds the entry gone.
+    clip_paths(pressed(&l, &[Item::mem("ok.txt", b"1".to_vec())]).0);
+    let dirs = entries(&l.state);
+    assert!(dirs.len() == 1 && names(&dirs[0]) == ["ok.txt"], "{dirs:?}");
+}
+
+#[test]
+fn the_workstation_stops_sending_data_after_an_end() {
+    let mut r = FakeRemote::start();
+    let big = r.root.join("big.bin");
+    fs::File::create(&big).unwrap().set_len(CAP + 1).unwrap(); // sparse
+    let ex = r.ex.clone();
+    let h = std::thread::spawn(move || {
+        wait_for("channel", || exchange::connected(&ex));
+        exchange::press(&ex, &[Item::file(&big).unwrap()], |_| panic!("clipboard"))
+    });
+    let (id, kind, _) = r.next();
+    assert_eq!(kind, OPEN);
+    r.send(id, END, &end(TOO_LARGE, "too large"));
+    // Count the frames that were on the way. The file holds 8192 chunks.
+    r.s.set_read_timeout(Some(Duration::from_millis(300))).unwrap();
+    let mut n = 0;
+    while read_frame(&mut r.s).is_ok() {
+        n += 1;
+    }
+    r.s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    assert!(n < 64, "{n} frames after the END");
+    assert!(matches!(h.join().unwrap(), Outcome::Failed(_)));
+    r.quiet();
+}

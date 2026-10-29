@@ -18,7 +18,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::SeqCst};
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 pub fn state() -> PathBuf {
     let d = PathBuf::from(std::env::var("HOME").unwrap()).join(".local/state/ferry");
@@ -120,34 +120,36 @@ fn show(r: Result<(u8, String), ()>, say: bool) -> i32 {
 }
 
 pub fn pull(x: &str, dest: Option<&str>) -> i32 {
+    pull_in(&state(), x, dest)
+}
+
+// `pull` with the state folder `dir`.
+pub fn pull_in(dir: &Path, x: &str, dest: Option<&str>) -> i32 {
     let open = format!("pull\t{x}");
     if !fits(&open) {
         return BAD_PATH as i32;
     }
     if dest == Some("-") {
-        return show(talk(&state(), &open, None, &mut io::stdout()), false);
+        return show(talk(dir, &open, None, &mut io::stdout()), false);
     }
-    pull_file(&open, x, dest).unwrap_or_else(|e| {
+    pull_file(dir, &open, x, dest).unwrap_or_else(|e| {
         eprintln!("ferry: {e}");
         1
     })
 }
 
-// Pull into a file. Err = a local file that ferry cannot write; the part file is gone.
-fn pull_file(open: &str, x: &str, dest: Option<&str>) -> Result<i32, String> {
+// Pull into a file. `dir` is the state folder. Err = a local file that ferry cannot write; the part file is gone.
+fn pull_file(dir: &Path, open: &str, x: &str, dest: Option<&str>) -> Result<i32, String> {
     let path = match dest {
         Some(d) => PathBuf::from(d),
         None => {
-            let dir = state().join("in").join((now_ms() / 1000).to_string());
-            fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-            let name: String =
-                base(x).chars().map(|c| if c.is_ascii_alphanumeric() || "._-".contains(c) { c } else { '_' }).collect();
-            dir.join(name)
+            let entry = landing(&dir.join("in")).map_err(|e| format!("Landing folder: {e}"))?;
+            entry.join(safe_name(base(x)))
         }
     };
     let part = path.with_extension("ferry-part");
     let mut f = File::create(&part).map_err(|e| format!("{}: {e}", part.display()))?;
-    let r = talk(&state(), open, None, &mut f);
+    let r = talk(dir, open, None, &mut f);
     if matches!(r, Ok((OK, _))) {
         if let Err(e) = fs::rename(&part, &path) {
             let _ = fs::remove_file(&part);
@@ -180,6 +182,58 @@ pub fn push(local: &str, x: &str) -> i32 {
     show(talk(&state(), &open, Some((f, size)), &mut io::sink()), true)
 }
 
+// ---- Landing folder ----
+
+// Each entry of `in/` older than this is deleted when a new entry starts.
+const KEEP: Duration = Duration::from_secs(7 * 86400);
+
+// A new entry `<inn>/<YYYYmmdd-HHMMSS>` (UTC, mode 0700). A name that exists gets `-2`, `-3`, and so on.
+// It also deletes the entries that are older than `KEEP`.
+fn landing(inn: &Path) -> io::Result<PathBuf> {
+    fs::DirBuilder::new().recursive(true).mode(0o700).create(inn)?;
+    for e in fs::read_dir(inn)?.filter_map(Result::ok) {
+        if e.metadata().and_then(|m| m.modified()).is_ok_and(|t| t.elapsed().is_ok_and(|age| age > KEEP)) {
+            let _ = fs::remove_dir_all(e.path());
+        }
+    }
+    let [y, mo, d, h, mi, s] = crate::lifecycle::utc(SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map_or(0, |t| t.as_secs()) as i64);
+    let stamp = format!("{y:04}{mo:02}{d:02}-{h:02}{mi:02}{s:02}");
+    let mut n = 1;
+    loop {
+        let entry = inn.join(if n == 1 { stamp.clone() } else { format!("{stamp}-{n}") });
+        match fs::DirBuilder::new().mode(0o700).create(&entry) {
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => n += 1,
+            r => return r.map(|()| entry),
+        }
+    }
+}
+
+// Keeps [A-Za-z0-9._-]; every other character becomes `_`, so a pasted path needs no quotes.
+// A name with no other character (`..` too) becomes `_`. A name over `NAME_MAX` loses the end
+// of its stem, so that `-100` and `.ferry-part` still fit in the 255 bytes of a file name.
+fn safe_name(name: &str) -> String {
+    const NAME_MAX: usize = 240;
+    let s: String = name.chars().map(|c| if c.is_ascii_alphanumeric() || "._-".contains(c) { c } else { '_' }).collect();
+    if s.trim_matches('.').is_empty() {
+        return "_".into();
+    }
+    let (stem, ext) = s.split_at(s.rfind('.').filter(|&i| i > 0 && s.len() - i <= 16).unwrap_or(s.len()));
+    if s.len() > NAME_MAX { format!("{}{ext}", &stem[..NAME_MAX - ext.len()]) } else { s }
+}
+
+// `name`, else `-2`, `-3`, and so on before the extension, until `taken` gives false.
+fn unique(name: &str, taken: impl Fn(&str) -> bool) -> String {
+    let (stem, ext) = name.split_at(name.rfind('.').filter(|&i| i > 0).unwrap_or(name.len()));
+    let mut n = 1;
+    loop {
+        let c = if n == 1 { name.to_string() } else { format!("{stem}-{n}{ext}") };
+        if !taken(&c) {
+            return c;
+        }
+        n += 1;
+    }
+}
+
 // ---- serve ----
 
 struct S {
@@ -191,6 +245,9 @@ struct S {
     echo: bool,
     done: Mutex<bool>,
     ended: Condvar,
+    // `in/`, and the hotkey presses that the Workstation streams (odd stream ids).
+    inn: PathBuf,
+    presses: Mutex<HashMap<u32, Press>>,
 }
 
 impl S {
@@ -245,6 +302,9 @@ fn quit(s: &S, why: &str, said: &str) {
             });
         }
     });
+    for (_, p) in s.presses.lock().unwrap().drain() {
+        let _ = fs::remove_dir_all(p.dir);
+    }
     *s.done.lock().unwrap() = true;
     s.ended.notify_all();
 }
@@ -304,6 +364,8 @@ pub fn serve_on(dir: &Path, r: impl Read + Send + 'static, mut w: impl Write + S
         echo,
         done: Mutex::new(false),
         ended: Condvar::new(),
+        inn: dir.join("in"),
+        presses: Mutex::default(),
     });
 
     // Handshake. The Workstation skips login noise up to MAGIC.
@@ -376,10 +438,13 @@ fn from_workstation(s: &S, mut r: impl Read) {
         s.rx_ms.store(now_ms(), SeqCst);
         match kind {
             PING => {}
+            OPEN if id % 2 == 1 => press_open(s, id, &p),
+            // The Workstation opens the odd streams. The data of a press goes to its files; `serve` sends the END.
+            DATA if id % 2 == 1 => press_data(s, id, &p),
             // A slow agent stalls this reader for 1 s at most: `to_agent` drops it then.
             DATA | END => s.to_agent(id, kind, &p),
-            // A CANCEL closes a stream that the Workstation opened. `serve` holds none, so the frame is dropped.
-            CANCEL => {}
+            // A CANCEL closes a press of the Workstation: its Landing folder entry goes. For other ids it is dropped.
+            CANCEL => press_cancel(s, id),
             BYE => return quit(s, &format!("BYE {}", String::from_utf8_lossy(&p)), ENDED),
             k => s.log(&format!("unknown frame kind {k} on {id}")),
         }
@@ -441,6 +506,134 @@ fn from_agent(s: &S, mut c: UnixStream) {
                 return;
             }
         }
+    }
+}
+
+// ---- hotkey press ----
+
+// One press of the Workstation. Its files go into one Landing folder entry, one after the
+// other, as the declared sizes split the data.
+struct Press {
+    dir: PathBuf,
+    // Final name and size of each file, in order.
+    files: Vec<(String, u64)>,
+    // The files in place. The next file gets the bytes, and `file` is its open part file.
+    done: usize,
+    file: Option<File>,
+    // Bytes that the open file, and all files, still need.
+    left: u64,
+    total: u64,
+}
+
+// The stream ends with this END, and `serve` sends no more frames for it.
+fn press_end(s: &S, id: u32, code: u8, msg: &str) {
+    s.log(&format!("press {id}: END {code} {msg}"));
+    s.out.stream(id, END, &end(code, msg));
+}
+
+// `OPEN hotkey <count> <name> <size> ...`
+fn press_open(s: &S, id: u32, p: &[u8]) {
+    let f = fields(p);
+    let n = f.get(1).and_then(|n| n.parse::<usize>().ok()).filter(|&n| n > 0 && f.len() == 2 + 2 * n);
+    let (Some(n), "hotkey") = (n, f[0].as_str()) else { return press_end(s, id, 1, "bad hotkey request") };
+    let mut files = Vec::new();
+    let mut total = 0u64;
+    for i in 0..n {
+        let Ok(size) = f[3 + 2 * i].parse::<u64>() else { return press_end(s, id, 1, "bad hotkey request") };
+        total = total.saturating_add(size);
+        files.push((f[2 + 2 * i].clone(), size));
+    }
+    if total > CAP {
+        return press_end(s, id, TOO_LARGE, &format!("{total} B is over the cap of {CAP} B"));
+    }
+    let dir = match landing(&s.inn) {
+        Ok(d) => d,
+        Err(e) => return press_end(s, id, 1, &format!("Landing folder: {e}")),
+    };
+    let mut names: Vec<String> = Vec::new();
+    for (name, _) in &mut files {
+        *name = unique(&safe_name(name), |c| names.iter().any(|x| x == c));
+        names.push(name.clone());
+    }
+    s.log(&format!("press {id}: {n} files, {total} B, {}", dir.display()));
+    let mut p = Press { dir, files, done: 0, file: None, left: 0, total };
+    match advance(&mut p) {
+        Ok(true) => press_done(s, id, &p),
+        Ok(false) => {
+            s.presses.lock().unwrap().insert(id, p);
+        }
+        Err(e) => {
+            let _ = fs::remove_dir_all(&p.dir);
+            press_end(s, id, 1, &e.to_string());
+        }
+    }
+}
+
+fn press_data(s: &S, id: u32, d: &[u8]) {
+    let mut m = s.presses.lock().unwrap();
+    let Some(p) = m.get_mut(&id) else { return };
+    let r = if d.len() as u64 > p.total { Err("more data than declared".to_string()) } else { store(p, d).map_err(|e| e.to_string()) };
+    match r {
+        Ok(false) => {}
+        Ok(true) => {
+            let p = m.remove(&id).unwrap();
+            drop(m);
+            press_done(s, id, &p);
+        }
+        Err(e) => {
+            let p = m.remove(&id).unwrap();
+            drop(m);
+            let _ = fs::remove_dir_all(&p.dir);
+            press_end(s, id, 1, &e);
+        }
+    }
+}
+
+// The Workstation gave up: the entry goes, and nothing is pasted.
+fn press_cancel(s: &S, id: u32) {
+    let p = s.presses.lock().unwrap().remove(&id);
+    if let Some(p) = p {
+        let _ = fs::remove_dir_all(&p.dir);
+        s.log(&format!("press {id}: CANCEL, entry deleted"));
+    }
+}
+
+// All files are in place. The paths go back for the clipboard of the Workstation. An attempt to
+// type them into the focused herdr pane goes here, before this reply.
+fn press_done(s: &S, id: u32, p: &Press) {
+    let paths: Vec<String> = p.files.iter().map(|(name, _)| p.dir.join(name).display().to_string()).collect();
+    press_end(s, id, OK, &format!("clip {}", paths.join(" ")));
+}
+
+// Writes `d` into the files. Ok(true) when the last file is in place.
+fn store(p: &mut Press, mut d: &[u8]) -> io::Result<bool> {
+    p.total -= d.len() as u64;
+    while !d.is_empty() {
+        let (now, rest) = d.split_at((d.len() as u64).min(p.left) as usize);
+        p.file.as_mut().unwrap().write_all(now)?;
+        p.left -= now.len() as u64;
+        d = rest;
+        advance(p)?;
+    }
+    Ok(p.done == p.files.len())
+}
+
+// Renames the part file when it is complete, then opens the part file of the next file. A file
+// of size 0 passes at once. Ok(true) when all files are in place.
+fn advance(p: &mut Press) -> io::Result<bool> {
+    loop {
+        if p.file.is_some() && p.left == 0 {
+            p.file = None;
+            let name = &p.files[p.done].0;
+            fs::rename(p.dir.join(format!("{name}.ferry-part")), p.dir.join(name))?;
+            p.done += 1;
+        }
+        let Some((name, size)) = p.files.get(p.done) else { return Ok(true) };
+        if p.file.is_some() {
+            return Ok(false);
+        }
+        p.file = Some(File::create(p.dir.join(format!("{name}.ferry-part")))?);
+        p.left = *size;
     }
 }
 

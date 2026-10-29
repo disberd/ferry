@@ -1,5 +1,5 @@
 // ferry: one binary for both sides of the Exchange folder and screenshot paths.
-//   Remote (Linux):      serve | ls | pull | push | hk-serve | hook
+//   Remote (Linux):      serve | ls | pull | push | hook
 //   Workstation (Windows): start | run | stop | status
 // Both: --version | version
 
@@ -11,8 +11,6 @@ mod lifecycle;
 mod link;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod sounds;
-#[cfg(unix)]
-mod hkserve;
 #[cfg(unix)]
 mod remote;
 mod exchange;
@@ -27,7 +25,7 @@ mod windows;
 #[cfg(all(test, unix))]
 mod loopback;
 
-const USAGE: &str = "usage: ferry --version | version | serve | ls [dir] | pull <xpath> [local|-] | push <local> [xpath] | hk-serve | hook | start <alias> [--hotkey <key>] [--apps <exe>,<exe>] | run <alias> [--hotkey <key>] [--apps <exe>,<exe>] | stop | status";
+const USAGE: &str = "usage: ferry --version | version | serve | ls [dir] | pull <xpath> [local|-] | push <local> [xpath] | hook | start <alias> [--hotkey <key>] [--apps <exe>,<exe>] | run <alias> [--hotkey <key>] [--apps <exe>,<exe>] | stop | status";
 
 // Checks the options of `start` and `run` before anything starts.
 #[cfg(windows)]
@@ -61,8 +59,6 @@ fn main() {
         ["push", l] => remote::push(l, remote::base(l)),
         #[cfg(unix)]
         ["push", l, x] => remote::push(l, x),
-        #[cfg(unix)]
-        ["hk-serve"] => hkserve::run(),
         #[cfg(unix)]
         ["hook"] => {
             let _ = std::io::copy(&mut std::io::stdin(), &mut std::io::sink());

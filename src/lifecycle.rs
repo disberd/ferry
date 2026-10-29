@@ -151,9 +151,16 @@ pub fn log_line(path: &Path, msg: &str) {
     append(path, &format!("{} {msg}\n", timestamp()));
 }
 
-// UTC `YYYY-MM-DD HH:MM:SS` from the system clock (days to date: Hinnant's civil_from_days).
+// UTC `YYYY-MM-DD HH:MM:SS` from the system clock.
 fn timestamp() -> String {
     let secs = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs()) as i64;
+    let [y, m, d, h, mi, s] = utc(secs);
+    format!("{y:04}-{m:02}-{d:02} {h:02}:{mi:02}:{s:02}")
+}
+
+// Year, month, day, hour, minute and second in UTC, for `secs` after the epoch (days to date:
+// Hinnant's civil_from_days).
+pub fn utc(secs: i64) -> [i64; 6] {
     let (days, rem) = (secs.div_euclid(86400), secs.rem_euclid(86400));
     let z = days + 719_468;
     let era = z.div_euclid(146_097);
@@ -164,7 +171,7 @@ fn timestamp() -> String {
     let d = doy - (153 * mp + 2) / 5 + 1;
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = yoe + era * 400 + i64::from(m <= 2);
-    format!("{y:04}-{m:02}-{d:02} {:02}:{:02}:{:02}", rem / 3600, rem % 3600 / 60, rem % 60)
+    [y, m, d, rem / 3600, rem % 3600 / 60, rem % 60]
 }
 
 // Gives the panic message and its source location, on one line, to `sink`. The

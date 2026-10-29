@@ -20,8 +20,8 @@ use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 #[cfg(windows)]
 use std::process::Child;
-use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::SeqCst};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 const PREV: &str = ".ferry-prev";
@@ -46,6 +46,10 @@ struct C {
     pushes: Mutex<HashMap<u32, Push>>,
     // The streams that this side answers (`ls`, `pull`), each with a flag for a CANCEL from the opener.
     answering: Mutex<HashMap<u32, bool>>,
+    // The hotkey presses that this side opened (odd ids), each with the END of the Remote once it came.
+    presses: Mutex<HashMap<u32, Option<(u8, String)>>>,
+    press_ended: Condvar,
+    press_next: AtomicU32,
 }
 
 impl C {
@@ -70,7 +74,7 @@ pub fn prepare(ex: &Path) -> io::Result<()> {
 pub fn run(alias: &str, link: &Link) {
     let remote = "~/.local/bin/ferry serve";
     let host = std::env::var("COMPUTERNAME").unwrap_or_default();
-    let ex = PathBuf::from(std::env::var("USERPROFILE").expect("USERPROFILE is not set")).join("ferry");
+    let ex = folder();
     prepare(&ex).unwrap();
     hide(&ex.join(PREV));
     hide(&ex.join(PART));
@@ -132,6 +136,9 @@ pub fn channel(mut stdin: impl Write + Send + 'static, r: impl Read, ex: &Path, 
         rx_ms: AtomicU64::new(now_ms()),
         pushes: Mutex::default(),
         answering: Mutex::default(),
+        presses: Mutex::default(),
+        press_ended: Condvar::new(),
+        press_next: AtomicU32::new(1),
     });
     c.out.ctrl(0, HELLO, format!("{PROTO}\t{VERSION}\t{host}").as_bytes());
     let c2 = c.clone();
@@ -159,7 +166,13 @@ pub fn channel(mut stdin: impl Write + Send + 'static, r: impl Read, ex: &Path, 
             hello(&f);
             if f[0] == PROTO {
                 log(&format!("HELLO {}: ready", f.join(" ")));
-                session(&c, &mut r)
+                LIVE.lock().unwrap().insert(ex.to_path_buf(), c.clone());
+                let why = session(&c, &mut r);
+                let mut live = LIVE.lock().unwrap();
+                if live.get(ex).is_some_and(|l| Arc::ptr_eq(l, &c)) {
+                    live.remove(ex);
+                }
+                why
             } else {
                 format!("version mismatch: Workstation {PROTO} ({VERSION}), Remote {} ({})", f[0], f.get(1).map_or("?", String::as_str))
             }
@@ -192,8 +205,8 @@ fn session(c: &Arc<C>, r: &mut impl BufRead) -> String {
                     *x = true;
                 } // else: the stream is closed or unknown, and the frame is dropped
             }
-            // The Workstation opens no request that an END could close.
-            END => {}
+            // The Remote answers a press with one END. The Workstation opens no other request.
+            END => press_ended(c, id, &p),
             BYE => return String::from_utf8_lossy(&p).to_string(),
             k => log(&format!("{id}: unknown frame kind {k}")),
         }
@@ -483,4 +496,182 @@ fn place(c: &C, p: &Push) -> Result<String, (u8, String)> {
     }
     fs::rename(&p.tmp, &p.target).map_err(|e| (1, e.to_string()))?;
     Ok(format!("saved: {}", p.rel))
+}
+
+// ---- hotkey press ----
+
+// The Exchange folder of the Workstation. It names the live channel for `press`.
+#[cfg(windows)]
+pub fn folder() -> PathBuf {
+    PathBuf::from(std::env::var("USERPROFILE").expect("USERPROFILE is not set")).join("ferry")
+}
+
+// The channel of each Exchange folder, from its `HELLO` to its end. A press finds its channel here.
+static LIVE: Mutex<std::collections::BTreeMap<PathBuf, Arc<C>>> = Mutex::new(std::collections::BTreeMap::new());
+
+#[cfg(test)]
+pub fn connected(ex: &Path) -> bool {
+    LIVE.lock().unwrap().contains_key(ex)
+}
+
+// A press holds at most this many files.
+const MAX_FILES: usize = 100;
+
+pub enum Src {
+    File(PathBuf),
+    Mem(Vec<u8>),
+}
+
+// One file of a press. A press sends exactly `size` bytes of it.
+pub struct Item {
+    pub name: String,
+    pub size: u64,
+    pub src: Src,
+}
+
+impl Item {
+    // A file on disk, with its size now.
+    pub fn file(p: &Path) -> io::Result<Item> {
+        let name = p.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+        Ok(Item { name, size: fs::metadata(p)?.len(), src: Src::File(p.to_path_buf()) })
+    }
+
+    pub fn mem(name: &str, data: Vec<u8>) -> Item {
+        Item { name: name.into(), size: data.len() as u64, src: Src::Mem(data) }
+    }
+}
+
+#[derive(Debug, PartialEq)]
+pub enum Outcome {
+    // The Remote typed the paths into a herdr pane.
+    Pasted,
+    // The paths are on the clipboard, or `set_clip` failed.
+    Clip(Vec<String>),
+    // The cause is in the text; the press gave the error sound.
+    Failed(String),
+}
+
+// One hotkey press: sends `items` over the channel of the Exchange folder `ex`, waits for the
+// reply and acts on it. `set_clip` puts text on the clipboard of the Workstation; it gets the
+// paths of a `clip` reply that passed the clip check. This plays the sound and logs the cause of
+// a failure. It blocks until the reply, so a caller keeps it off its message loop.
+pub fn press(ex: &Path, items: &[Item], set_clip: impl FnOnce(&str) -> bool) -> Outcome {
+    let out = send(ex, items);
+    match &out {
+        Outcome::Pasted => {}
+        Outcome::Clip(paths) => {
+            let text = paths.join(" ");
+            let ok = set_clip(&text);
+            log(&format!("press: paths on the clipboard ({}): {text}", if ok { "ok" } else { "FAILED" }));
+            play(if ok { Sound::Clip } else { Sound::Error });
+        }
+        Outcome::Failed(why) => {
+            log(why);
+            play(Sound::Error);
+        }
+    }
+    out
+}
+
+fn send(ex: &Path, items: &[Item]) -> Outcome {
+    let Some(c) = LIVE.lock().unwrap().get(ex).cloned() else { return Outcome::Failed("press: no channel to the Remote".into()) };
+    let mut open = format!("hotkey\t{}", items.len());
+    for it in items {
+        open += &format!("\t{}\t{}", it.name.replace('\t', "_"), it.size);
+    }
+    if items.len() > MAX_FILES || open.len() > CHUNK {
+        return Outcome::Failed(format!("press refused: {} files, OPEN of {} B", items.len(), open.len()));
+    }
+    let id = c.press_next.fetch_add(2, SeqCst);
+    c.presses.lock().unwrap().insert(id, None);
+    c.out.ctrl(id, OPEN, open.as_bytes());
+    log(&format!("{id}: OPEN hotkey, {} files", items.len()));
+    if let Err(why) = feed(&c, id, items) {
+        c.out.ctrl(id, CANCEL, b"");
+        c.presses.lock().unwrap().remove(&id);
+        return Outcome::Failed(format!("press {id}: {why}, CANCEL"));
+    }
+    let (code, text) = c.wait_end(id);
+    log(&format!("{id}: END {code} {text}"));
+    match (code, text.as_str()) {
+        (OK, "pasted") => Outcome::Pasted,
+        (OK, t) => match t.strip_prefix("clip ").and_then(clip_paths) {
+            Some(paths) => Outcome::Clip(paths),
+            None => Outcome::Failed(format!("press: the clip reply fails the check: {t}")),
+        },
+        _ => Outcome::Failed(format!("press: END {code} {text}")),
+    }
+}
+
+// The paths of a `clip` reply, if each one matches `^/[A-Za-z0-9._/-]+$`. A path that
+// passes holds no space, quote or control character, so a paste of it runs no command.
+fn clip_paths(text: &str) -> Option<Vec<String>> {
+    let ok = |p: &str| p.len() > 1 && p.starts_with('/') && p.bytes().all(|b| b.is_ascii_alphanumeric() || b"._/-".contains(&b));
+    text.split(' ').all(ok).then(|| text.split(' ').map(String::from).collect())
+}
+
+// The data of a press: each item in order, in chunks. Err = this side cannot go on and the press
+// needs a CANCEL. Ok also when the Remote has ended the stream early: its END is in `presses`.
+fn feed(c: &C, id: u32, items: &[Item]) -> Result<(), String> {
+    let mut buf = vec![0; CHUNK];
+    for it in items {
+        match &it.src {
+            Src::Mem(d) => {
+                for chunk in d.chunks(CHUNK) {
+                    if !put(c, id, chunk)? {
+                        return Ok(());
+                    }
+                }
+            }
+            Src::File(p) => {
+                let mut f = File::open(p).map_err(|e| format!("cannot read {}: {e}", p.display()))?;
+                let mut left = it.size;
+                while left > 0 {
+                    let n = f.read(&mut buf[..left.min(CHUNK as u64) as usize]).map_err(|e| format!("cannot read {}: {e}", p.display()))?;
+                    if n == 0 {
+                        return Err(format!("{} is shorter than {} B", p.display(), it.size));
+                    }
+                    if !put(c, id, &buf[..n])? {
+                        return Ok(());
+                    }
+                    left -= n as u64;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+// One chunk of data. False when the Remote has ended the stream already.
+fn put(c: &C, id: u32, d: &[u8]) -> Result<bool, String> {
+    if matches!(c.presses.lock().unwrap().get(&id), Some(Some(_))) {
+        return Ok(false);
+    }
+    if c.out.stream(id, DATA, d) { Ok(true) } else { Err("channel ended".into()) }
+}
+
+// The END of a press.
+fn press_ended(c: &C, id: u32, p: &[u8]) {
+    let f = fields(p);
+    if let Some(slot) = c.presses.lock().unwrap().get_mut(&id).filter(|s| s.is_none()) {
+        *slot = Some((f[0].parse().unwrap_or(1), f.get(1).cloned().unwrap_or_default()));
+        c.press_ended.notify_all();
+    } // else: the stream is closed or unknown, and the frame is dropped
+}
+
+impl C {
+    // The END of press `id`. A channel that ends first gives exit 1.
+    fn wait_end(&self, id: u32) -> (u8, String) {
+        let mut m = self.presses.lock().unwrap();
+        loop {
+            if let Some(Some(_)) = m.get(&id) {
+                return m.remove(&id).unwrap().unwrap();
+            }
+            if self.out.dead() {
+                m.remove(&id);
+                return (1, "channel ended".into());
+            }
+            m = self.press_ended.wait_timeout(m, Duration::from_secs(1)).unwrap().0;
+        }
+    }
 }

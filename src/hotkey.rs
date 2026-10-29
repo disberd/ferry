@@ -1,17 +1,15 @@
-// Workstation side of the hotkey flow. Opens one hidden
-// `ssh.exe -T <alias> ~/.local/bin/ferry hk-serve`, then waits for Ctrl+Alt+V.
-// On the hotkey it reads the clipboard: files (CF_HDROP) first, else the PNG
-// image, else an error sound. It sends them to `hk-serve`, which types the
-// Remote paths into the focused herdr pane. If `hk-serve` cannot paste, the
-// paths go to the clipboard. Every step is logged.
+// Workstation side of the hotkey flow. It waits for Ctrl+Alt+V. On the hotkey it reads the
+// clipboard: files (CF_HDROP) first, else the PNG image, else an error sound. `exchange::press`
+// sends them to `ferry serve` over the channel; `serve` types the Remote paths into the focused
+// herdr pane, or the paths go to the clipboard. The press runs on its own thread, so the
+// message loop (and the tray icon) stays live during a transfer. Every step is logged.
 
 use std::ffi::c_void;
+use crate::exchange::{self, Item};
 use crate::lifecycle::Opts;
 use crate::sounds::{play, Sound};
-use crate::windows::{last_error, log, ssh, wide};
-use std::io::{BufRead, BufReader, Write};
+use crate::windows::{last_error, log, wide};
 use std::path::PathBuf;
-use std::process::{Child, ChildStdin, ChildStdout};
 use std::time::Instant;
 
 type H = *mut c_void;
@@ -58,7 +56,6 @@ const WM_HOTKEY: u32 = 0x0312;
 const MOD_NOREPEAT: u32 = 0x4000;
 const CF_UNICODETEXT: u32 = 13;
 const CF_HDROP: u32 = 15;
-const REMOTE: &str = "~/.local/bin/ferry hk-serve";
 
 fn format_name(f: u32) -> String {
     let known = [(1, "TEXT"), (2, "BITMAP"), (3, "METAFILEPICT"), (7, "OEMTEXT"), (8, "DIB"), (13, "UNICODETEXT"),
@@ -148,39 +145,7 @@ fn foreground_title() -> String {
     String::from_utf16_lossy(&buf[..n.max(0) as usize])
 }
 
-struct Conn {
-    _child: Child,
-    stdin: ChildStdin,
-    stdout: BufReader<ChildStdout>,
-}
-
-fn connect(alias: &str) -> std::io::Result<Conn> {
-    log(&format!("connect: {alias} {REMOTE}"));
-    let mut child = ssh(alias, REMOTE)?;
-    let stderr = child.stderr.take().unwrap();
-    std::thread::spawn(move || {
-        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-            log(&format!("ssh: {line}"));
-        }
-    });
-    Ok(Conn { stdin: child.stdin.take().unwrap(), stdout: BufReader::new(child.stdout.take().unwrap()), _child: child })
-}
-
-fn send(conn: &mut Conn, items: &[(String, Vec<u8>)]) -> std::io::Result<String> {
-    write!(conn.stdin, "SEND {}\n", items.len())?;
-    for (name, data) in items {
-        write!(conn.stdin, "{} {name}\n", data.len())?;
-        conn.stdin.write_all(data)?;
-    }
-    conn.stdin.flush()?;
-    let mut reply = String::new();
-    if conn.stdout.read_line(&mut reply)? == 0 {
-        return Err(std::io::Error::other("serve closed the channel"));
-    }
-    Ok(reply.trim_end().to_string())
-}
-
-fn on_hotkey(conn: &mut Option<Conn>, alias: &str) {
+fn on_hotkey() {
     let t = Instant::now();
     log(&format!("HOTKEY, foreground window: {:?}", foreground_title()));
     let (clip, formats) = match read_clipboard() {
@@ -191,12 +156,12 @@ fn on_hotkey(conn: &mut Option<Conn>, alias: &str) {
         }
     };
     log(&format!("  clipboard formats: {}", formats.join(", ")));
-    let items: Vec<(String, Vec<u8>)> = match clip {
+    let items: Vec<Item> = match clip {
         Clip::Nothing => {
             log("  nothing to send (no HDROP, no PNG)");
             return play(Sound::Error);
         }
-        Clip::Png(data) => vec![("screenshot.png".into(), data)],
+        Clip::Png(data) => vec![Item::mem("screenshot.png", data)],
         Clip::Files(files) => {
             if let Some(dir) = files.iter().find(|p| p.is_dir()) {
                 log(&format!("  REFUSED: folder {}", dir.display()));
@@ -204,8 +169,8 @@ fn on_hotkey(conn: &mut Option<Conn>, alias: &str) {
             }
             let mut v = Vec::new();
             for p in &files {
-                match std::fs::read(p) {
-                    Ok(d) => v.push((p.file_name().unwrap().to_string_lossy().into_owned(), d)),
+                match Item::file(p) {
+                    Ok(i) => v.push(i),
                     Err(e) => {
                         log(&format!("  FAIL: read {}: {e}", p.display()));
                         return play(Sound::Error);
@@ -215,64 +180,26 @@ fn on_hotkey(conn: &mut Option<Conn>, alias: &str) {
             v
         }
     };
-    let bytes: usize = items.iter().map(|(_, d)| d.len()).sum();
-    let names: Vec<&str> = items.iter().map(|(n, _)| n.as_str()).collect();
-    log(&format!("  read {} item(s), {bytes} B in {} ms: {}", items.len(), t.elapsed().as_millis(), names.join(", ")));
-
-    let mut reply = conn.as_mut().map_or(Err(std::io::Error::other("no channel")), |c| send(c, &items));
-    if let Err(e) = &reply {
-        log(&format!("  channel error: {e}, reconnect and retry once"));
-        *conn = connect(alias).ok();
-        reply = conn.as_mut().map_or(Err(std::io::Error::other("no channel")), |c| send(c, &items));
-    }
-    let reply = match reply {
-        Ok(r) => r,
-        Err(e) => {
-            *conn = None;
-            log(&format!("  FAIL: {e}"));
-            return play(Sound::Error);
-        }
-    };
-    let total = t.elapsed().as_millis();
-    let parts: Vec<&str> = reply.split('\t').collect();
-    match parts.as_slice() {
-        ["PASTED", pane, agent, ms, paths] => {
-            log(&format!("  PASTED into {pane} (agent {agent}): {paths}"));
-            log(&format!("  hotkey to reply {total} ms, of which serve save+paste {ms} ms"));
-        }
-        ["CLIP", reason, ms, paths] => {
-            let ok = set_clipboard_text(paths);
-            log(&format!("  NO PASTE: {reason}"));
-            log(&format!("  paths on Workstation clipboard ({}): {paths}", if ok { "ok" } else { "FAILED" }));
-            log(&format!("  hotkey to reply {total} ms, of which serve {ms} ms"));
-            play(Sound::Clip);
-        }
-        _ => {
-            log(&format!("  FAIL: bad reply {reply:?}"));
-            play(Sound::Error);
-        }
-    }
+    let bytes: u64 = items.iter().map(|i| i.size).sum();
+    let names: Vec<&str> = items.iter().map(|i| i.name.as_str()).collect();
+    log(&format!("  {} item(s), {bytes} B: {}", items.len(), names.join(", ")));
+    std::thread::spawn(move || {
+        exchange::press(&exchange::folder(), &items, set_clipboard_text);
+        log(&format!("  hotkey to reply {} ms", t.elapsed().as_millis()));
+    });
 }
 
 // Runs on the thread that calls it: RegisterHotKey binds to that thread.
 pub fn run(o: &Opts) {
-    let alias = &o.alias;
     if unsafe { RegisterHotKey(std::ptr::null_mut(), 1, o.mods | MOD_NOREPEAT, o.vk) } == 0 {
         return log(&format!("FAIL: RegisterHotKey {}, error {} (1409 = another program has it)", o.hotkey, last_error()));
     }
-    let mut conn = match connect(alias) {
-        Ok(c) => Some(c),
-        Err(e) => {
-            log(&format!("FAIL: spawn ssh.exe: {e}"));
-            None
-        }
-    };
     log(&format!("ready: press {}", o.hotkey));
 
     let mut msg: Msg = unsafe { std::mem::zeroed() };
     while unsafe { GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) } > 0 {
         if msg.message == WM_HOTKEY {
-            on_hotkey(&mut conn, alias);
+            on_hotkey();
         } else {
             unsafe { DispatchMessageW(&msg) };
         }
