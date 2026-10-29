@@ -71,6 +71,7 @@ extern "system" {
     fn GetCursorPos(p: *mut [i32; 2]) -> i32;
     fn SetForegroundWindow(h: H) -> i32;
     fn GetSystemMetrics(i: i32) -> i32;
+    fn SetProcessDpiAwarenessContext(ctx: isize) -> i32;
 }
 #[link(name = "gdi32")]
 extern "system" {
@@ -102,6 +103,7 @@ const MF_SEPARATOR: u32 = 0x800;
 const TPM_RIGHTBUTTON: u32 = 2;
 const TPM_RETURNCMD: u32 = 0x100;
 const SM_CXSMICON: i32 = 49;
+const DPI_AWARENESS_CONTEXT_SYSTEM_AWARE: isize = -2;
 const OPEN_LOG: i32 = 1;
 const QUIT: i32 = 2;
 
@@ -251,7 +253,12 @@ unsafe extern "system" fn window_proc(h: H, m: u32, w: usize, l: isize) -> isize
 // Makes the hidden window and the icon. Call it on the thread that runs the
 // message loop. A failure only costs the icon, so it goes to the log.
 pub fn create(link: Arc<Link>, state: State, log_path: String) {
+    // A process that is not DPI aware gets the 16 px size at each display scale,
+    // and Windows then stretches the icon, so it is blurred. This call must come
+    // before the first window of the process.
+    unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_SYSTEM_AWARE) };
     let n = unsafe { GetSystemMetrics(SM_CXSMICON) }.max(16);
+    log(&format!("tray icon {n} px"));
     let icons = [Icon::Normal, Icon::Grey, Icon::Alert].map(|i| make_icon(n, i) as usize);
     let created = unsafe { RegisterWindowMessageW(wide("TaskbarCreated").as_ptr()) };
     let c = CTX.get_or_init(|| Ctx { link, state, log: log_path, icons, created });
