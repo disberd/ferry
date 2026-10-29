@@ -60,10 +60,7 @@ fn main() {
         #[cfg(unix)]
         ["push", l, x] => remote::push(l, x),
         #[cfg(unix)]
-        ["hook"] => {
-            let _ = std::io::copy(&mut std::io::stdin(), &mut std::io::sink());
-            0
-        }
+        ["hook"] => remote::hook(&remote::state(), &std::env::var("HERDR_PLUGIN_EVENT_JSON").unwrap_or_default()),
         #[cfg(windows)]
         ["start", ref r @ ..] => with_opts(r, windows::start),
         #[cfg(windows)]

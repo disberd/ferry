@@ -28,6 +28,7 @@ pub const PING: u8 = 6;
 #[cfg(unix)]
 pub const TAKEOVER: u8 = 7;
 pub const BYE: u8 = 8;
+pub const ALERT: u8 = 9;
 
 // Exit codes of the agent commands. END carries them.
 pub const OK: u8 = 0;

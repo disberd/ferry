@@ -1344,3 +1344,54 @@ fn the_workstation_stops_sending_data_after_an_end() {
     assert!(matches!(h.join().unwrap(), Outcome::Failed(_)));
     r.quiet();
 }
+
+fn asked(s: crate::sounds::Sound) -> usize {
+    crate::sounds::ASKED.lock().unwrap().iter().filter(|&&x| x == s).count()
+}
+
+#[test]
+fn a_hook_alert_reaches_the_workstation_as_its_sound() {
+    use crate::sounds::Sound::{Blocked, Done};
+    let l = Loop::start();
+    let event = |status: &str| format!(r#"{{"event":"pane.agent_status_changed","data":{{"pane_id":"w1:p2","workspace_id":"w1","agent_status":"{status}","agent":"claude"}}}}"#);
+    // Only these two tests ask for Blocked and Done, so the counts are exact.
+    for status in ["working", "idle", "unknown"] {
+        assert_eq!(remote::hook(&l.state, &event(status)), 0);
+    }
+    assert_eq!(remote::hook(&l.state, &event("blocked")), 0);
+    wait_for("the Blocked sound", || asked(Blocked) == 1);
+    assert_eq!(remote::hook(&l.state, &event("done")), 0);
+    wait_for("the Done sound", || asked(Done) == 1);
+    assert_eq!(asked(Blocked), 1);
+}
+
+#[test]
+fn a_hook_sends_one_alert_for_blocked_and_done_only() {
+    let root = temp_root("hook");
+    let sock = UnixListener::bind(root.join("ferry.sock")).unwrap();
+    sock.set_nonblocking(true).unwrap();
+    let event = |status: &str| format!(r#"{{"data": {{"agent_status" : "{status}", "pane_id": "w1:p1"}}}}"#);
+    assert_eq!(remote::hook(&root, &event("working")), 0);
+    assert_eq!(remote::hook(&root, "not json"), 0);
+    assert!(sock.accept().is_err(), "a hook connected for a status that needs no alert");
+
+    assert_eq!(remote::hook(&root, &event("done")), 0);
+    let (mut c, _) = sock.accept().unwrap();
+    c.set_nonblocking(false).unwrap();
+    let mut got = Vec::new();
+    std::io::Read::read_to_end(&mut c, &mut got).unwrap();
+    assert_eq!(got, [remote::greet(PROTO, "hook"), frame(0, ALERT, b"done\tw1:p1")].concat());
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn a_hook_with_no_serve_exits_quietly() {
+    let root = temp_root("hook-off");
+    // No socket file: ENOENT.
+    assert_eq!(remote::hook(&root, r#"{"agent_status":"blocked","pane_id":"w1:p1"}"#), 0);
+    // A socket file that nobody listens on: ECONNREFUSED.
+    drop(UnixListener::bind(root.join("ferry.sock")).unwrap());
+    assert_eq!(remote::hook(&root, r#"{"agent_status":"done","pane_id":"w1:p1"}"#), 0);
+    assert!(!root.join("serve.log").exists());
+    let _ = fs::remove_dir_all(root);
+}

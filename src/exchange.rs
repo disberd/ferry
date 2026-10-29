@@ -208,6 +208,11 @@ fn session(c: &Arc<C>, r: &mut impl BufRead) -> String {
             // The Remote answers a press with one END. The Workstation opens no other request.
             END => press_ended(c, id, &p),
             BYE => return String::from_utf8_lossy(&p).to_string(),
+            ALERT => match fields(&p)[0].as_str() {
+                "blocked" => play(Sound::Blocked),
+                "done" => play(Sound::Done),
+                s => log(&format!("ALERT with status {s}")),
+            },
             k => log(&format!("{id}: unknown frame kind {k}")),
         }
     }

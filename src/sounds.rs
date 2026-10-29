@@ -8,12 +8,9 @@ use std::time::{Duration, Instant};
 
 const QUIET: Duration = Duration::from_millis(1500);
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Sound {
-    // No caller yet for these two.
-    #[allow(dead_code)]
     Blocked,
-    #[allow(dead_code)]
     Done,
     Arrival,
     Error,
@@ -55,8 +52,14 @@ impl Window {
 
 static WINDOW: Mutex<Window> = Mutex::new(Window(None));
 
+// Every sound that `play` was asked for, also those that the quiet window drops.
+#[cfg(test)]
+pub static ASKED: Mutex<Vec<Sound>> = Mutex::new(Vec::new());
+
 // Plays `s` when the quiet window allows it. A new sound stops the one that plays.
 pub fn play(s: Sound) {
+    #[cfg(test)]
+    ASKED.lock().unwrap_or_else(|e| e.into_inner()).push(s);
     let admitted = WINDOW.lock().unwrap_or_else(|e| e.into_inner()).admit(Instant::now(), s.rank());
     #[cfg(windows)]
     if admitted {

@@ -234,6 +234,40 @@ fn unique(name: &str, taken: impl Fn(&str) -> bool) -> String {
     }
 }
 
+// The string value of `key` in a flat JSON text (no escapes). herdr writes `pane_id` and
+// `agent_status` that way.
+fn json_str<'a>(json: &'a str, key: &str) -> Option<&'a str> {
+    let rest = json[json.find(&format!("\"{key}\""))? + key.len() + 2..].trim_start().strip_prefix(':')?;
+    rest.trim_start().strip_prefix('"')?.split('"').next()
+}
+
+// `ferry hook`: herdr runs it for each agent status change; `event` is the event JSON. For
+// `blocked` and `done` it sends one ALERT to `serve` and waits for no reply. It never blocks
+// longer than its two 1 s timeouts. With no `serve` (refused or no socket) it exits quietly.
+pub fn hook(dir: &Path, event: &str) -> i32 {
+    let status = json_str(event, "agent_status").unwrap_or_default();
+    if status != "blocked" && status != "done" {
+        return 0;
+    }
+    let alert = frame(0, ALERT, format!("{status}\t{}", json_str(event, "pane_id").unwrap_or_default()).as_bytes());
+    // std has no connect timeout for Unix sockets, so the connect runs in a thread.
+    let (tx, rx) = std::sync::mpsc::channel();
+    let sock = dir.join("ferry.sock");
+    std::thread::spawn(move || drop(tx.send(UnixStream::connect(sock))));
+    let sent = match rx.recv_timeout(Duration::from_secs(1)) {
+        Ok(Ok(mut s)) => s.set_write_timeout(Some(Duration::from_secs(1))).and_then(|_| s.write_all(&[greet(PROTO, "hook"), alert].concat())),
+        Ok(Err(e)) => Err(e),
+        Err(_) => Err(io::ErrorKind::TimedOut.into()),
+    };
+    if let Err(e) = sent {
+        if !matches!(e.kind(), io::ErrorKind::ConnectionRefused | io::ErrorKind::NotFound) {
+            let line = format!("{:.3} hook[{}]: {e}\n", now_ms() as f64 / 1000.0, std::process::id());
+            crate::lifecycle::append(&dir.join("serve.log"), &line);
+        }
+    }
+    0
+}
+
 // ---- serve ----
 
 struct S {
@@ -478,6 +512,7 @@ fn from_agent(s: &S, mut c: UnixStream) {
             std::thread::sleep(Duration::from_millis(300)); // let the writer send BYE
             return quit(s, "replaced by a new connection", REPLACED);
         }
+        ("hook", ALERT) => return s.out.ctrl(0, ALERT, &p),
         ("cli", OPEN) => {}
         _ => return,
     }
