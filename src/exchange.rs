@@ -116,7 +116,7 @@ fn connect(alias: &str, remote: &str, host: &str, ex: &Path, link: &Link, last: 
     let ch = child.clone();
     let why = channel(stdin, stdout, ex, host, move || {
         let _ = ch.lock().unwrap().kill();
-    }, |f| link.hello(f));
+    }, |f| link.hello(f), |f| link.herdr(f));
     let _ = child.lock().unwrap().kill();
     let _ = child.lock().unwrap().wait();
     // Another process can hold the stderr pipe open, so the wait has a limit.
@@ -127,7 +127,8 @@ fn connect(alias: &str, remote: &str, host: &str, ex: &Path, link: &Link, last: 
 // One connection over any byte channel: the pipes of ssh.exe, or a socket pair
 // in the tests. `stop` ends the channel when the Remote goes silent. `hello`
 // gets the fields of the `HELLO` of the Remote, also when the protocol differs.
-pub fn channel(mut stdin: impl Write + Send + 'static, r: impl Read, ex: &Path, host: &str, stop: impl Fn() + Send + 'static, hello: impl FnOnce(&[String])) -> Result<String, String> {
+// `herdr` gets the fields of each `HERDR` frame and says whether the error sound is due.
+pub fn channel(mut stdin: impl Write + Send + 'static, r: impl Read, ex: &Path, host: &str, stop: impl Fn() + Send + 'static, hello: impl FnOnce(&[String]), herdr: impl Fn(&[String]) -> bool) -> Result<String, String> {
     let mut r = BufReader::with_capacity(CHUNK + 9, r);
     stdin.write_all(MAGIC).map_err(|e| e.to_string())?;
     let c = Arc::new(C {
@@ -168,7 +169,7 @@ pub fn channel(mut stdin: impl Write + Send + 'static, r: impl Read, ex: &Path, 
                 log(&format!("HELLO {}: ready", f.join(" ")));
                 LIVE.lock().unwrap().insert(ex.to_path_buf(), c.clone());
                 LIVE_UP.notify_all();
-                let why = session(&c, &mut r);
+                let why = session(&c, &mut r, &herdr);
                 let mut live = LIVE.lock().unwrap();
                 if live.get(ex).is_some_and(|l| Arc::ptr_eq(l, &c)) {
                     live.remove(ex);
@@ -187,7 +188,7 @@ pub fn channel(mut stdin: impl Write + Send + 'static, r: impl Read, ex: &Path, 
     Ok(why)
 }
 
-fn session(c: &Arc<C>, r: &mut impl BufRead) -> String {
+fn session(c: &Arc<C>, r: &mut impl BufRead, herdr: &impl Fn(&[String]) -> bool) -> String {
     loop {
         let (id, kind, p) = match read_frame(r) {
             Ok(f) => f,
@@ -214,6 +215,11 @@ fn session(c: &Arc<C>, r: &mut impl BufRead) -> String {
                 "done" => play(Sound::Done),
                 s => log(&format!("ALERT with status {s}")),
             },
+            HERDR => {
+                if herdr(&fields(&p)) {
+                    play(Sound::Error);
+                }
+            }
             k => log(&format!("{id}: unknown frame kind {k}")),
         }
     }

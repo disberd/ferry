@@ -9,7 +9,7 @@
 // stream id on the channel and copies the replies back.
 
 use crate::frame::*;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::Shutdown;
@@ -383,7 +383,7 @@ pub fn serve() -> i32 {
     let log = d.join("serve.log");
     crate::lifecycle::rotate(&log);
     crate::lifecycle::panic_hook(move |m| crate::lifecycle::append(&log, &format!("{:.3} serve[{}]: {m}\n", now_ms() as f64 / 1000.0, std::process::id())));
-    serve_with(&d, herdr_sock(), io::stdin(), io::stdout(), true)
+    serve_with(&d, herdr_sock(), HERDR_EVERY, io::stdin(), io::stdout(), true)
 }
 
 // The default herdr socket, with the rule of herdr for its config folder: `$XDG_CONFIG_HOME`
@@ -399,13 +399,13 @@ pub fn herdr_sock_in(xdg: Option<std::ffi::OsString>, home: std::ffi::OsString) 
 // `serve_with` for a state folder that has no herdr socket: a press never pastes.
 #[cfg(test)]
 pub fn serve_on(dir: &Path, r: impl Read + Send + 'static, w: impl Write + Send + 'static, echo: bool) -> i32 {
-    serve_with(dir, dir.join("no-herdr.sock"), r, w, echo)
+    serve_with(dir, dir.join("no-herdr.sock"), HERDR_EVERY, r, w, echo)
 }
 
-// Runs one channel: `r` and `w` are the pipes to the Workstation, `dir` is
-// the state folder (it must exist) and `herdr` is the herdr socket. Returns when the channel or the
-// replacement ends it. `echo` copies the log lines to stderr.
-pub fn serve_with(dir: &Path, herdr: PathBuf, r: impl Read + Send + 'static, mut w: impl Write + Send + 'static, echo: bool) -> i32 {
+// Runs one channel: `r` and `w` are the pipes to the Workstation, `dir` is the state folder
+// (it must exist) and `herdr` is the herdr socket, checked every `every`. Returns when the
+// channel or the replacement ends it. `echo` copies the log lines to stderr.
+pub fn serve_with(dir: &Path, herdr: PathBuf, every: Duration, r: impl Read + Send + 'static, mut w: impl Write + Send + 'static, echo: bool) -> i32 {
     let me = fs::read_to_string("/proc/sys/kernel/hostname").unwrap_or_default().trim().to_string();
     let s = Arc::new(S {
         out: Out::default(),
@@ -471,6 +471,8 @@ pub fn serve_with(dir: &Path, herdr: PathBuf, r: impl Read + Send + 'static, mut
         }
     });
     s.log(&format!("ready, {}", sock.display()));
+    let s2 = s.clone();
+    std::thread::spawn(move || herdr_loop(&s2, every));
     let s2 = s.clone();
     std::thread::spawn(move || {
         for c in listener.incoming().map_while(Result::ok) {
@@ -683,9 +685,15 @@ fn json_esc(s: &str) -> String {
 }
 
 // One call: a new connection, one JSON line out, one line back. The reply must hold a `result`.
-// A Unix connect has no timeout in std, so the whole call runs in a thread and `HERDR_WAIT`
-// limits the wait for it. The thread ends by itself, because its reads and writes time out too.
 fn herdr_call(sock: &Path, req: String) -> Result<String, String> {
+    let line = herdr_line(sock, req)?;
+    if line.contains("\"result\"") { Ok(line) } else { Err(format!("herdr: {}", line.trim())) }
+}
+
+// The reply line of one call. A Unix connect has no timeout in std, so the whole call runs in a
+// thread and `HERDR_WAIT` limits the wait for it. The thread ends by itself, because its reads
+// and writes time out too.
+fn herdr_line(sock: &Path, req: String) -> Result<String, String> {
     let (tx, rx) = std::sync::mpsc::channel();
     let sock = sock.to_path_buf();
     std::thread::spawn(move || {
@@ -700,8 +708,203 @@ fn herdr_call(sock: &Path, req: String) -> Result<String, String> {
         };
         drop(tx.send(io()));
     });
-    let line = rx.recv_timeout(HERDR_WAIT).map_err(|_| "herdr timed out".to_string())?.map_err(|e| format!("herdr socket: {e}"))?;
-    if line.contains("\"result\"") { Ok(line) } else { Err(format!("herdr: {}", line.trim())) }
+    rx.recv_timeout(HERDR_WAIT).map_err(|_| "herdr timed out".to_string())?.map_err(|e| format!("herdr socket: {e}"))
+}
+
+// ---- herdr check ----
+
+// The time between two herdr checks.
+pub const HERDR_EVERY: Duration = Duration::from_secs(60);
+
+// The herdr version that ferry was tested with.
+const HERDR_TESTED: &str = "0.9.5";
+
+// The JSON of a herdr reply. Only what the check reads: strings, arrays, objects and booleans.
+#[derive(Debug)]
+enum J {
+    Str(String),
+    Bool(bool),
+    Arr(Vec<J>),
+    Obj(Vec<(String, J)>),
+    Other,
+}
+
+impl J {
+    fn get(&self, key: &str) -> Option<&J> {
+        match self {
+            J::Obj(kv) => kv.iter().find(|(k, _)| k == key).map(|(_, v)| v),
+            _ => None,
+        }
+    }
+
+    fn str(&self) -> Option<&str> {
+        match self {
+            J::Str(s) => Some(s),
+            _ => None,
+        }
+    }
+
+    fn arr(&self) -> &[J] {
+        match self {
+            J::Arr(v) => v,
+            _ => &[],
+        }
+    }
+}
+
+// One JSON value at the start of `s`, and the text after it.
+fn parse(s: &str) -> Option<(J, &str)> {
+    let s = s.trim_start();
+    match s.chars().next()? {
+        '"' => {
+            let (mut out, mut it) = (String::new(), s[1..].char_indices());
+            while let Some((i, c)) = it.next() {
+                match c {
+                    '"' => return Some((J::Str(out), &s[i + 2..])),
+                    '\\' => match it.next()?.1 {
+                        'u' => out.push(u32::from_str_radix(&(&mut it).take(4).map(|x| x.1).collect::<String>(), 16).ok().and_then(char::from_u32).unwrap_or('?')),
+                        'n' => out.push('\n'),
+                        'r' => out.push('\r'),
+                        't' => out.push('\t'),
+                        e => out.push(e),
+                    },
+                    c => out.push(c),
+                }
+            }
+            None
+        }
+        open @ ('[' | '{') => {
+            let (close, mut rest) = if open == '[' { (']', s[1..].trim_start()) } else { ('}', s[1..].trim_start()) };
+            let (mut arr, mut obj) = (Vec::new(), Vec::new());
+            if let Some(after) = rest.strip_prefix(close) {
+                rest = after;
+            } else {
+                loop {
+                    let key = if open == '{' {
+                        let (k, r) = parse(rest)?;
+                        rest = r.trim_start().strip_prefix(':')?;
+                        Some(k.str()?.to_string())
+                    } else {
+                        None
+                    };
+                    let (v, r) = parse(rest)?;
+                    match key {
+                        Some(k) => obj.push((k, v)),
+                        None => arr.push(v),
+                    }
+                    rest = r.trim_start();
+                    match rest.chars().next()? {
+                        ',' => rest = &rest[1..],
+                        c if c == close => {
+                            rest = &rest[1..];
+                            break;
+                        }
+                        _ => return None,
+                    }
+                }
+            }
+            Some((if open == '[' { J::Arr(arr) } else { J::Obj(obj) }, rest))
+        }
+        _ => {
+            let n = s.find([',', ']', '}', ' ', '\t', '\r', '\n']).unwrap_or(s.len());
+            let v = match &s[..n] {
+                "" => return None,
+                "true" => J::Bool(true),
+                "false" => J::Bool(false),
+                _ => J::Other,
+            };
+            Some((v, &s[n..]))
+        }
+    }
+}
+
+// The result of one check: `state` is `not running`, `failed` or `ok`, `text` is the part of the
+// `herdr:` line of `ferry status` after its label, and `warnings` are for the log.
+struct Check {
+    state: &'static str,
+    text: String,
+    warnings: Vec<String>,
+}
+
+// `ping`, then `plugin.list`, on the herdr socket.
+fn check(sock: &Path) -> Check {
+    let verdict = |state, text: String, warnings| Check { state, text, warnings };
+    let not_running = || verdict("not running", "not running".into(), vec![]);
+    // The whole reply, or `Err(None)` when herdr gives no usable answer, or `Err(Some(message))`
+    // for a method error.
+    let call = |method: &str| -> Result<J, Option<String>> {
+        let line = herdr_line(sock, format!(r#"{{"id":"1","method":"{method}","params":{{}}}}"#)).map_err(|_| None)?;
+        let v = parse(&line).ok_or(None)?.0;
+        if let Some(e) = v.get("error") {
+            return Err(Some(e.get("message").and_then(J::str).unwrap_or("error").to_string()));
+        }
+        v.get("result").ok_or(None)?;
+        Ok(v)
+    };
+    let ping = match call("ping") {
+        Ok(v) => v,
+        Err(None) => return not_running(),
+        Err(Some(m)) => return verdict("failed", format!("ping failed: {m}"), vec![]),
+    };
+    let list = match call("plugin.list") {
+        Ok(v) => v,
+        Err(None) => return not_running(),
+        Err(Some(m)) => return verdict("failed", format!("plugin.list failed: {m}"), vec![]),
+    };
+    let version = ping.get("result").and_then(|r| r.get("version")).and_then(J::str).unwrap_or("unknown");
+    let mut warnings = Vec::new();
+    if version != HERDR_TESTED {
+        warnings.push(format!("herdr {version} differs from the tested {HERDR_TESTED}"));
+    }
+    let mut bad = Vec::new();
+    let plugin = list.get("result").and_then(|r| r.get("plugins")).map_or(&[][..], J::arr).iter().find(|p| p.get("plugin_id").and_then(J::str) == Some("ferry"));
+    match plugin {
+        None => bad.push("ferry plugin not linked".to_string()),
+        Some(p) => {
+            if matches!(p.get("enabled"), Some(J::Bool(false))) {
+                bad.push("ferry plugin disabled".into());
+            }
+            if !p.get("events").map_or(&[][..], J::arr).iter().any(|e| e.get("on").and_then(J::str) == Some("pane.agent_status_changed")) {
+                bad.push("alert hook missing".into());
+            }
+            for w in p.get("warnings").map_or(&[][..], J::arr).iter().filter_map(J::str) {
+                if w.starts_with("unknown event") || w.starts_with("manifest unavailable: ") {
+                    bad.push(format!("plugin warning: {w}"));
+                } else {
+                    warnings.push(format!("plugin warning: {w}"));
+                }
+            }
+        }
+    }
+    if !bad.is_empty() {
+        return verdict("failed", bad.join("; "), warnings);
+    }
+    let tested = if version == HERDR_TESTED { String::new() } else { format!(" (tested: {HERDR_TESTED})") };
+    verdict("ok", format!("{version}{tested} · alert hook ok"), warnings)
+}
+
+// Checks at the start and then every `every`, until `serve` ends. `HERDR` goes to the Workstation
+// at the first result and when the result changes. A warning goes to the log once.
+fn herdr_loop(s: &S, every: Duration) {
+    let (mut sent, mut warned) = (String::new(), HashSet::new());
+    loop {
+        let c = check(&s.herdr);
+        let payload = format!("{}\t{}", c.state, c.text);
+        if payload != sent {
+            s.log(&format!("herdr {}: {}", c.state, c.text));
+            s.out.ctrl(0, HERDR, payload.as_bytes());
+            sent = payload;
+        }
+        for w in c.warnings {
+            if warned.insert(w.clone()) {
+                s.log(&format!("herdr: {w}"));
+            }
+        }
+        let (done, _) = s.ended.wait_timeout_while(s.done.lock().unwrap(), every, |d| !*d).unwrap();
+        if *done {
+            return;
+        }
+    }
 }
 
 // Writes `d` into the files. Ok(true) when the last file is in place.

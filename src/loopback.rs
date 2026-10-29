@@ -33,7 +33,7 @@ fn pair(state: &Path, ex: &Path, host: &'static str) -> (UnixStream, JoinHandle<
     let b2 = b.try_clone().unwrap();
     let serve = std::thread::spawn(move || remote::serve_on(&st, b, b2, false));
     let a2 = a.try_clone().unwrap();
-    let ws = std::thread::spawn(move || exchange::channel(a2, a, &ex, host, || {}, |_| {}));
+    let ws = std::thread::spawn(move || exchange::channel(a2, a, &ex, host, || {}, |_| {}, |_| false));
     (channel, serve, ws)
 }
 
@@ -339,7 +339,7 @@ impl FakeRemote {
         let (a, mut s) = UnixStream::pair().unwrap();
         s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         let (a2, ex2) = (a.try_clone().unwrap(), ex.clone());
-        let ws = Some(std::thread::spawn(move || exchange::channel(a2, a, &ex2, "test-host", || {}, |_| {})));
+        let ws = Some(std::thread::spawn(move || exchange::channel(a2, a, &ex2, "test-host", || {}, |_| {}, |_| false)));
         s.write_all(MAGIC).unwrap();
         s.write_all(&frame(0, HELLO, format!("{PROTO}\t0\tremote").as_bytes())).unwrap();
         let mut m = [0u8; 8];
@@ -549,15 +549,25 @@ impl FakeWs {
     }
 
     // `herdr` is the file name of the herdr socket in the root folder. Nothing listens on it
-    // until the test binds it.
+    // until the test binds it. The first `HERDR` frame is read here, so the tests that follow
+    // see the frames of their own requests.
     fn start_with(herdr: &str) -> FakeWs {
+        let mut w = FakeWs::launch(herdr, Duration::from_secs(60), |_| {});
+        assert_eq!(w.next().1, HERDR);
+        w
+    }
+
+    // `serve` with a herdr check every `every`. The test reads the `HERDR` frames. `prep` gets
+    // the herdr socket path before `serve` starts, so a fake herdr can listen for the first check.
+    fn launch(herdr: &str, every: Duration, prep: impl FnOnce(&Path)) -> FakeWs {
         let root = temp_root("ws");
         let state = root.join("state");
         fs::DirBuilder::new().recursive(true).mode(0o700).create(&state).unwrap();
         let (mut s, b) = UnixStream::pair().unwrap();
         s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         let (st, b2, herdr) = (state.clone(), b.try_clone().unwrap(), root.join(herdr));
-        let serve = Some(std::thread::spawn(move || remote::serve_with(&st, herdr, b, b2, false)));
+        prep(&herdr);
+        let serve = Some(std::thread::spawn(move || remote::serve_with(&st, herdr, every, b, b2, false)));
         s.write_all(MAGIC).unwrap();
         s.write_all(&frame(0, HELLO, format!("{PROTO}\t0\tws").as_bytes())).unwrap();
         let mut m = [0u8; 8];
@@ -715,7 +725,7 @@ fn scripted(script: &[u8], stderr_line: &str) -> (crate::link::Chan, Option<u64>
         up2.fetch_or(r.connected, SeqCst);
     });
     let a2 = a.try_clone().unwrap();
-    let why = exchange::channel(a2, a, &std::env::temp_dir(), "ws", || {}, |f| link.hello(f)).unwrap();
+    let why = exchange::channel(a2, a, &std::env::temp_dir(), "ws", || {}, |f| link.hello(f), |f| link.herdr(f)).unwrap();
     let wait = link.ended(&why, stderr_line);
     (link.chan(), wait, up.load(SeqCst))
 }
@@ -1497,7 +1507,7 @@ fn late_remote() -> FakeRemote {
     let (a, s) = UnixStream::pair().unwrap();
     s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
     let (a2, ex2) = (a.try_clone().unwrap(), ex.clone());
-    let ws = Some(std::thread::spawn(move || exchange::channel(a2, a, &ex2, "test-host", || {}, |_| {})));
+    let ws = Some(std::thread::spawn(move || exchange::channel(a2, a, &ex2, "test-host", || {}, |_| {}, |_| false)));
     FakeRemote { root, ex, s, ws, last_ls: 1000 }
 }
 
@@ -1586,4 +1596,239 @@ fn a_newer_press_takes_over_from_one_that_waits_and_only_its_copy_is_sent() {
     r.send(1, END, b"0\tpasted");
     assert_eq!(new.join().unwrap(), Outcome::Pasted);
     r.quiet();
+}
+
+// ---- herdr check ----
+
+const PONG: &str = r#"{"id":"1","result":{"type":"pong","version":"0.9.5","protocol":22,"capabilities":{}}}"#;
+const HOOK: &str = r#"{"on":"pane.agent_status_changed","command":["./ferry","hook"]}"#;
+
+// A `plugin.list` reply with the given plugin objects.
+fn plugin_list(plugins: &[String]) -> String {
+    format!(r#"{{"id":"1","result":{{"type":"plugin_list","plugins":[{}]}}}}"#, plugins.join(","))
+}
+
+// The ferry plugin as `plugin.list` shows it. `extra` is more members of the object.
+fn ferry_plugin(enabled: bool, events: &str, extra: &str) -> String {
+    format!(r#"{{"plugin_id":"ferry","enabled":{enabled},"events":[{events}]{extra}}}"#)
+}
+
+// A herdr that answers each connection by its method. The replies can change while it runs. A
+// method with no reply gets a closed connection. The second value counts the `ping` calls.
+type Replies = Arc<Mutex<std::collections::HashMap<&'static str, String>>>;
+
+fn herdr_daemon(sock: &Path, ping: &str, list: &str) -> (Replies, Arc<AtomicU32>) {
+    use std::io::{BufRead, BufReader};
+    let replies: Replies = Arc::default();
+    replies.lock().unwrap().extend([("ping", ping.to_string()), ("plugin.list", list.to_string())]);
+    replies.lock().unwrap().retain(|_, r| !r.is_empty());
+    let listener = UnixListener::bind(sock).unwrap();
+    let (r2, pings) = (replies.clone(), Arc::new(AtomicU32::new(0)));
+    let p2 = pings.clone();
+    std::thread::spawn(move || {
+        for mut c in listener.incoming().map_while(Result::ok) {
+            let mut line = String::new();
+            let _ = BufReader::new(c.try_clone().unwrap()).read_line(&mut line);
+            let method = ["ping", "plugin.list"].into_iter().find(|m| line.contains(&format!(r#""method":"{m}""#)));
+            if method == Some("ping") {
+                p2.fetch_add(1, SeqCst);
+            }
+            if let Some(r) = method.and_then(|m| r2.lock().unwrap().get(m).cloned()) {
+                let _ = writeln!(c, "{r}");
+            }
+        }
+    });
+    (replies, pings)
+}
+
+// A `serve` that checks a fake herdr every 20 ms. Returns it with the fake herdr's controls.
+fn herdr_ws(ping: &str, list: &str) -> (FakeWs, Replies, Arc<AtomicU32>) {
+    let mut fake = None;
+    let (ping, list) = (ping.to_string(), list.to_string());
+    let w = FakeWs::launch("herdr.sock", Duration::from_millis(20), |sock| fake = Some(herdr_daemon(sock, &ping, &list)));
+    let (replies, pings) = fake.unwrap();
+    (w, replies, pings)
+}
+
+// The `HERDR` frame that comes next: its state and its text.
+fn next_herdr(w: &mut FakeWs) -> (String, String) {
+    let (id, kind, p) = w.next();
+    assert_eq!((id, kind), (0, HERDR));
+    let f = fields(&p);
+    (f[0].clone(), f[1].clone())
+}
+
+#[test]
+fn the_check_gives_ok_with_the_version_and_adds_the_tested_version_when_it_differs() {
+    let list = plugin_list(&[ferry_plugin(true, HOOK, "")]);
+    let (mut w, replies, _) = herdr_ws(PONG, &list);
+    // This is the first frame after the HELLO: the check runs at the start.
+    assert_eq!(next_herdr(&mut w), ("ok".into(), "0.9.5 · alert hook ok".into()));
+    replies.lock().unwrap().insert("ping", PONG.replace("0.9.5", "0.9.6"));
+    assert_eq!(next_herdr(&mut w), ("ok".into(), "0.9.6 (tested: 0.9.5) · alert hook ok".into()));
+}
+
+#[test]
+fn the_check_fails_for_each_condition_of_the_spec_and_names_the_item() {
+    let other = r#"{"on":"pane.updated","command":["./x"]}"#;
+    let cases: Vec<(&str, String, &str)> = vec![
+        ("plugin not linked", plugin_list(&[]), "not linked"),
+        ("another plugin only", plugin_list(&[r#"{"plugin_id":"other","enabled":true,"events":[]}"#.into()]), "not linked"),
+        ("plugin disabled", plugin_list(&[ferry_plugin(false, HOOK, "")]), "disabled"),
+        ("no events", plugin_list(&[r#"{"plugin_id":"ferry","enabled":true}"#.into()]), "hook"),
+        ("another event only", plugin_list(&[ferry_plugin(true, other, "")]), "hook"),
+        ("unknown event warning", plugin_list(&[ferry_plugin(true, HOOK, r#","warnings":["unknown event 'pane.agent_done'"]"#)]), "unknown event"),
+        ("warning text with JSON syntax in it", plugin_list(&[ferry_plugin(true, HOOK, r#","warnings":["unknown event '}{ \" ]'"]"#)]), "unknown event"),
+        ("manifest unavailable warning", plugin_list(&[ferry_plugin(true, HOOK, r#","warnings":["manifest unavailable: gone"]"#)]), "manifest unavailable"),
+        ("plugin.list method error", r#"{"id":"2","error":{"code":"unknown_method","message":"no such method"}}"#.into(), "no such method"),
+    ];
+    for (what, list, item) in cases {
+        let (mut w, _, _) = herdr_ws(PONG, &list);
+        let (state, text) = next_herdr(&mut w);
+        assert_eq!(state, "failed", "{what}: {text}");
+        assert!(text.contains(item), "{what}: {text}");
+    }
+    let (mut w, _, _) = herdr_ws(r#"{"id":"1","error":{"code":"internal","message":"broken"}}"#, &plugin_list(&[ferry_plugin(true, HOOK, "")]));
+    let (state, text) = next_herdr(&mut w);
+    assert!((state.as_str(), text.contains("broken")) == ("failed", true), "ping error: {state} {text}");
+}
+
+#[test]
+fn the_check_gives_not_running_for_a_missing_socket_and_for_no_answer() {
+    let list = plugin_list(&[ferry_plugin(true, HOOK, "")]);
+    let mut missing = FakeWs::launch("no-herdr.sock", Duration::from_secs(60), |_| {});
+    assert_eq!(next_herdr(&mut missing), ("not running".into(), "not running".into()));
+    // The socket exists, but ping gets no reply. A reply that is no JSON is no answer either.
+    for (what, ping, list) in [("no ping reply", "", list.as_str()), ("no JSON", "hello", list.as_str()), ("no plugin.list reply", PONG, "")] {
+        let (mut w, _, _) = herdr_ws(ping, list);
+        assert_eq!(next_herdr(&mut w).0, "not running", "{what}");
+    }
+}
+
+#[test]
+fn a_warning_that_is_not_a_failure_keeps_the_check_ok_and_is_logged_once() {
+    let warn = "no platforms in the manifest";
+    let list = plugin_list(&[ferry_plugin(true, HOOK, &format!(r#","warnings":["{warn}"]"#))]);
+    let (mut w, _, pings) = herdr_ws(PONG, &list);
+    assert_eq!(next_herdr(&mut w).0, "ok");
+    wait_for("four checks", || pings.load(SeqCst) >= 4);
+    let log = fs::read_to_string(w.state.join("serve.log")).unwrap();
+    assert_eq!(log.matches(warn).count(), 1, "{log}");
+}
+
+#[test]
+fn serve_sends_herdr_again_only_when_the_result_changes() {
+    let list = plugin_list(&[ferry_plugin(true, HOOK, "")]);
+    let (mut w, replies, pings) = herdr_ws(PONG, &list);
+    assert_eq!(next_herdr(&mut w).0, "ok");
+    // Several more checks with the same result send nothing.
+    let n = pings.load(SeqCst);
+    wait_for("more checks", || pings.load(SeqCst) >= n + 4);
+    assert!(!frame_comes(&mut w.s));
+    // herdr loses the plugin, and later the hook comes back.
+    replies.lock().unwrap().insert("plugin.list", plugin_list(&[]));
+    assert_eq!(next_herdr(&mut w).0, "failed");
+    replies.lock().unwrap().insert("plugin.list", list);
+    assert_eq!(next_herdr(&mut w).0, "ok");
+    // herdr stops: the next result is `not running`.
+    replies.lock().unwrap().clear();
+    assert_eq!(next_herdr(&mut w).0, "not running");
+}
+
+fn herdr_link() -> (crate::link::Link, Arc<Mutex<Vec<crate::link::Report>>>) {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let s2 = seen.clone();
+    (crate::link::Link::new("alias", "key", || "09:12".into(), move |r| s2.lock().unwrap().push(r.clone())), seen)
+}
+
+fn hello_ok(l: &crate::link::Link) {
+    l.connecting();
+    l.hello(&[PROTO.into(), "1.0.0".into()]);
+}
+
+fn herdr_line(l: &crate::link::Link) -> String {
+    l.view().unwrap().0.herdr
+}
+
+fn fr(state: &str, text: &str) -> Vec<String> {
+    vec![state.into(), text.into()]
+}
+
+#[test]
+fn the_herdr_line_shows_each_form_and_only_failed_gives_the_red_dot() {
+    use crate::link::Icon;
+    let (l, _) = herdr_link();
+    hello_ok(&l);
+    assert_eq!(herdr_line(&l), "unknown");
+    for (state, text, icon) in [
+        ("ok", "0.9.5 · alert hook ok", Icon::Normal),
+        ("ok", "0.9.6 (tested: 0.9.5) · alert hook ok", Icon::Normal),
+        ("not running", "not running", Icon::Normal),
+        ("failed", "alert hook missing", Icon::Alert),
+    ] {
+        l.herdr(&fr(state, text));
+        assert_eq!(herdr_line(&l), text);
+        assert_eq!(l.view().unwrap().1.icon, icon, "{state}");
+    }
+    assert_eq!(l.view().unwrap().1.tip, "ferry · herdr alert hook missing");
+    // The line is unknown while the channel is down, and the red dot goes with it.
+    l.ended("gone", "");
+    assert_eq!(herdr_line(&l), "unknown (offline)");
+    assert_eq!(l.view().unwrap().1.icon, Icon::Grey);
+    // A new connection shows no old result until the new `HERDR` comes.
+    hello_ok(&l);
+    assert_eq!(herdr_line(&l), "unknown");
+    assert_eq!(l.view().unwrap().1.icon, Icon::Normal);
+}
+
+#[test]
+fn the_error_sound_is_due_once_when_the_state_changes_to_failed_also_across_reconnects() {
+    let (l, _) = herdr_link();
+    hello_ok(&l);
+    // The first state of the process counts as a change.
+    assert!(l.herdr(&fr("failed", "alert hook missing")));
+    assert!(!l.herdr(&fr("failed", "alert hook missing")));
+    assert!(!l.herdr(&fr("failed", "ferry plugin disabled")));
+    // A reconnect with the same failure gives no sound.
+    l.ended("gone", "");
+    hello_ok(&l);
+    assert!(!l.herdr(&fr("failed", "alert hook missing")));
+    // Other states give none; a new failure after them does.
+    assert!(!l.herdr(&fr("ok", "0.9.5 · alert hook ok")));
+    assert!(!l.herdr(&fr("not running", "not running")));
+    assert!(l.herdr(&fr("failed", "alert hook missing")));
+    // `not running` is no failure at the first state of a process either.
+    let (l, _) = herdr_link();
+    hello_ok(&l);
+    assert!(!l.herdr(&fr("not running", "not running")));
+}
+
+#[test]
+fn a_herdr_frame_on_the_channel_reaches_the_link_and_a_failure_asks_for_the_error_sound() {
+    use crate::sounds::Sound::Error;
+    let root = temp_root("herdr-link");
+    let (a, mut s) = UnixStream::pair().unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let (link, _) = herdr_link();
+    let (link, bells) = (Arc::new(link), Arc::new(AtomicU32::new(0)));
+    let (a2, ex, l1, l2, b2) = (a.try_clone().unwrap(), root.clone(), link.clone(), link.clone(), bells.clone());
+    let before = asked(Error);
+    let ws = std::thread::spawn(move || {
+        exchange::channel(a2, a, &ex, "test-host", || {}, |f| l1.hello(f), move |f| {
+            let due = l2.herdr(f);
+            b2.fetch_add(u32::from(due), SeqCst);
+            due
+        })
+    });
+    s.write_all(MAGIC).unwrap();
+    s.write_all(&frame(0, HELLO, format!("{PROTO}\t0\tremote").as_bytes())).unwrap();
+    for text in ["alert hook missing", "alert hook missing"] {
+        s.write_all(&frame(0, HERDR, format!("failed\t{text}").as_bytes())).unwrap();
+    }
+    wait_for("the herdr line", || link.view().is_some_and(|v| v.0.herdr == "alert hook missing"));
+    assert_eq!(bells.load(SeqCst), 1);
+    assert!(asked(Error) > before);
+    let _ = s.shutdown(std::net::Shutdown::Both);
+    let _ = ws.join();
+    let _ = fs::remove_dir_all(root);
 }

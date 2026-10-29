@@ -143,7 +143,14 @@ fn minutes(since: &str, now: &str) -> u32 {
 }
 
 // The icon and the hover line of a channel state. `now` is the local `HH:MM`.
+#[cfg(test)]
 pub fn tray(chan: &Chan, alias: &str, now: &str) -> Tray {
+    tray_with(chan, alias, now, &[])
+}
+
+// `tray` with more reasons that need the user to act. They come after the channel reasons,
+// worst first, and each is the hover text that it adds.
+fn tray_with(chan: &Chan, alias: &str, now: &str, reasons: &[String]) -> Tray {
     let state = match chan {
         Chan::Connecting => format!("connecting to {alias}"),
         Chan::Connected { .. } => format!("connected to {alias}"),
@@ -158,6 +165,7 @@ pub fn tray(chan: &Chan, alias: &str, now: &str) -> Tray {
     if matches!(chan, Chan::Mismatch { .. } | Chan::Replaced { .. }) {
         act.push(&state);
     }
+    act.extend(reasons.iter().map(String::as_str));
     let icon = match (act.is_empty(), chan) {
         (false, _) => Icon::Alert,
         (true, Chan::Connected { .. }) => Icon::Normal,
@@ -191,6 +199,11 @@ struct Inner {
     kick: Option<Kick>,
     // The report and the tray view of the last change.
     last: Option<(Report, Tray)>,
+    // The last `HERDR` state and text. It stays across reconnects, so a reconnect with the same
+    // failure gives no second sound.
+    herdr: Option<(String, String)>,
+    // True when `herdr` came on the current connection.
+    herdr_now: bool,
 }
 
 // The state of the channel. The connect loop changes it; the hotkey and the
@@ -209,7 +222,7 @@ impl Link {
     // `hotkey` is the text after `hotkey: `. `clock` gives the local `HH:MM`.
     // `sink` gets the report at each state change.
     pub fn new(alias: &str, hotkey: &str, clock: fn() -> String, sink: impl Fn(&Report) + Send + Sync + 'static) -> Link {
-        let m = Inner { chan: Chan::Connecting, backoff: Backoff::default(), down: None, mismatch: None, kick: None, last: None };
+        let m = Inner { chan: Chan::Connecting, backoff: Backoff::default(), down: None, mismatch: None, kick: None, last: None, herdr: None, herdr_now: false };
         Link { alias: alias.into(), hotkey: hotkey.into(), since: clock(), clock, sink: Box::new(sink), m: Mutex::new(m), cv: Condvar::new() }
     }
 
@@ -217,16 +230,26 @@ impl Link {
         let connected = matches!(chan, Chan::Connected { .. });
         let now = (self.clock)();
         g.chan = chan;
+        let seen = if connected && g.herdr_now { g.herdr.clone() } else { None };
+        // The reasons that need the user to act, after those of the channel. A new reason is one more line here.
+        let mut reasons: Vec<String> = Vec::new();
+        if let Some((_, text)) = seen.as_ref().filter(|(state, _)| state == "failed") {
+            reasons.push(format!("herdr {text}"));
+        }
         let rep = Report {
             since: self.since.clone(),
             changed: now.clone(),
             connected,
             channel: g.chan.text(&self.alias).replace(['\r', '\n'], " "),
-            herdr: if connected { "unknown" } else { "unknown (offline)" }.into(),
+            herdr: match (&seen, connected) {
+                (Some((_, text)), _) => text.replace(['\r', '\n'], " "),
+                (None, true) => "unknown".into(),
+                (None, false) => "unknown (offline)".into(),
+            },
             hotkey: self.hotkey.clone(),
         };
         (self.sink)(&rep);
-        g.last = Some((rep, tray(&g.chan, &self.alias, &now)));
+        g.last = Some((rep, tray_with(&g.chan, &self.alias, &now, &reasons)));
     }
 
     // The report and the tray view of the last change, or `None` before the first.
@@ -253,6 +276,7 @@ impl Link {
     pub fn hello(&self, f: &[String]) {
         let mut g = self.m.lock().unwrap();
         if f[0] == PROTO {
+            g.herdr_now = false;
             g.backoff.reset();
             g.down = None;
             let chan = Chan::Connected { since: (self.clock)(), version: f.get(1).cloned().unwrap_or_default() };
@@ -335,6 +359,19 @@ impl Link {
         if !matches!(self.m.lock().unwrap().chan, Chan::Connecting) {
             self.connect_now();
         }
+    }
+
+    // A `HERDR` frame: `f` holds the state and the text. The report shows it, and a `failed`
+    // state gives the red dot. Returns true when the error sound is due: the state changed to
+    // `failed` from another state, or from none (the first one since this process started).
+    pub fn herdr(&self, f: &[String]) -> bool {
+        let mut g = self.m.lock().unwrap();
+        let bell = f[0] == "failed" && g.herdr.as_ref().is_none_or(|(s, _)| s != "failed");
+        g.herdr = Some((f[0].clone(), f[1..].join(" ")));
+        g.herdr_now = true;
+        let chan = g.chan.clone();
+        self.set(&mut g, chan);
+        bell
     }
 }
 
