@@ -228,8 +228,12 @@ pub fn run(o: &Opts) -> i32 {
     log(&format!("ferry {} run {} exe {exe}, hotkey {}, apps {}", crate::frame::VERSION, o.alias, o.hotkey, o.apps.join(",")));
     let link = std::sync::Arc::new(Link::new(&o.alias, &format!("{} for {}", o.hotkey, o.apps.join(", ")), local_hhmm, {
         let s = s.clone();
+        // A report for a focus change keeps the channel text: it gets no log line.
+        let logged = Mutex::new(String::new());
         move |r| {
-            log(&format!("channel: {}", r.channel));
+            if std::mem::replace(&mut *logged.lock().unwrap_or_else(|e| e.into_inner()), r.channel.clone()) != r.channel {
+                log(&format!("channel: {}", r.channel));
+            }
             write_state(&s, r);
             crate::tray::changed();
         }

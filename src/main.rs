@@ -6,6 +6,7 @@
 // The Workstation core runs on Linux too, but only the tests use it there.
 #![cfg_attr(not(any(windows, test)), allow(dead_code))]
 
+mod active;
 mod frame;
 mod lifecycle;
 mod link;

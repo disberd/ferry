@@ -3,6 +3,7 @@
 // drives it, `windows.rs` stores each change in the state file, and `ferry
 // status` prints the stored text.
 
+use crate::active::Seen;
 use crate::frame::{fields, read_frame, HELLO, MAGIC, PROTO};
 use crate::lifecycle::State;
 use std::io::{BufRead, ErrorKind, Read};
@@ -148,9 +149,8 @@ pub fn tray(chan: &Chan, alias: &str, now: &str) -> Tray {
     tray_with(chan, alias, now, &[])
 }
 
-// `tray` with more reasons that need the user to act. They come after the channel reasons,
-// worst first, and each is the hover text that it adds.
-fn tray_with(chan: &Chan, alias: &str, now: &str, reasons: &[String]) -> Tray {
+// `tray` with more reasons for the red dot, already formatted and worst first.
+pub fn tray_with(chan: &Chan, alias: &str, now: &str, reasons: &[String]) -> Tray {
     let state = match chan {
         Chan::Connecting => format!("connecting to {alias}"),
         Chan::Connected { .. } => format!("connected to {alias}"),
@@ -204,6 +204,8 @@ struct Inner {
     herdr: Option<(String, String)>,
     // True when `herdr` came on the current connection.
     herdr_now: bool,
+    // The foreground exe and the key clash, as the hotkey side saw them last.
+    seen: Seen,
 }
 
 // The state of the channel. The connect loop changes it; the hotkey and the
@@ -222,7 +224,7 @@ impl Link {
     // `hotkey` is the text after `hotkey: `. `clock` gives the local `HH:MM`.
     // `sink` gets the report at each state change.
     pub fn new(alias: &str, hotkey: &str, clock: fn() -> String, sink: impl Fn(&Report) + Send + Sync + 'static) -> Link {
-        let m = Inner { chan: Chan::Connecting, backoff: Backoff::default(), down: None, mismatch: None, kick: None, last: None, herdr: None, herdr_now: false };
+        let m = Inner { chan: Chan::Connecting, backoff: Backoff::default(), down: None, mismatch: None, kick: None, last: None, herdr: None, herdr_now: false, seen: Seen::default() };
         Link { alias: alias.into(), hotkey: hotkey.into(), since: clock(), clock, sink: Box::new(sink), m: Mutex::new(m), cv: Condvar::new() }
     }
 
@@ -246,9 +248,10 @@ impl Link {
                 (None, true) => "unknown".into(),
                 (None, false) => "unknown (offline)".into(),
             },
-            hotkey: self.hotkey.clone(),
+            hotkey: g.seen.line(&self.hotkey),
         };
         (self.sink)(&rep);
+        reasons.extend(g.seen.clash());
         g.last = Some((rep, tray_with(&g.chan, &self.alias, &now, &reasons)));
     }
 
@@ -372,6 +375,16 @@ impl Link {
         let chan = g.chan.clone();
         self.set(&mut g, chan);
         bell
+    }
+
+    // The hotkey side saw a new foreground exe or a new clash: the report and the tray follow.
+    pub fn focus(&self, seen: Seen) {
+        let mut g = self.m.lock().unwrap();
+        if g.seen != seen {
+            g.seen = seen;
+            let chan = g.chan.clone();
+            self.set(&mut g, chan);
+        }
     }
 }
 
@@ -710,5 +723,41 @@ mod tests {
         let (r, t) = l.view().unwrap();
         assert!(r.connected);
         assert_eq!(t.icon, Icon::Normal);
+    }
+
+    const CLASH: &str = "hotkey Ctrl+Alt+V: taken by another program";
+
+    #[test]
+    fn a_taken_hotkey_shows_the_red_dot_with_the_clash_text() {
+        let up = Chan::Connected { since: "09:12".into(), version: "1.0.0".into() };
+        let clash = [CLASH.to_string()];
+        let t = tray_with(&up, "work", "09:24", &clash);
+        assert_eq!((t.icon, t.tip.as_str()), (Icon::Alert, "ferry · hotkey Ctrl+Alt+V: taken by another program"));
+        // A grey channel state turns to the red dot too, and a version mismatch is worse.
+        assert_eq!(tray_with(&Chan::Connecting, "work", "09:24", &clash).icon, Icon::Alert);
+        let m = Chan::Mismatch { remote: "1".into(), wait: 5 };
+        assert_eq!(tray_with(&m, "work", "09:24", &clash).tip, format!("ferry · {}", m.text("work")));
+    }
+
+    #[test]
+    fn the_hotkey_line_follows_the_focus_and_the_clash() {
+        let (l, seen) = link();
+        l.connecting();
+        l.focus(Seen { taken: None, exe: Some(("rio.exe".into(), true)) });
+        l.focus(Seen { taken: None, exe: Some(("rio.exe".into(), true)) });
+        // The same view twice is one change.
+        assert_eq!(seen.lock().unwrap().len(), 2);
+        assert_eq!(seen.lock().unwrap()[1].hotkey, "Ctrl+Alt+V for rio.exe · foreground now: rio.exe (on the list)");
+        l.focus(Seen { taken: Some("Ctrl+Alt+V".into()), exe: Some(("rio.exe".into(), true)) });
+        assert_eq!(l.view().unwrap().1.icon, Icon::Alert);
+        assert_eq!(seen.lock().unwrap()[2].hotkey, format!("{CLASH} · foreground now: rio.exe (on the list)"));
+        // A channel change keeps the hotkey line and the dot.
+        hello(&l, PROTO);
+        let (r, t) = l.view().unwrap();
+        assert!(r.hotkey.starts_with(CLASH));
+        assert_eq!(t.icon, Icon::Alert);
+        l.focus(Seen { taken: None, exe: Some(("chrome.exe".into(), false)) });
+        let (r, t) = l.view().unwrap();
+        assert_eq!((r.hotkey.as_str(), t.icon), ("Ctrl+Alt+V for rio.exe · foreground now: chrome.exe (not on the list)", Icon::Normal));
     }
 }

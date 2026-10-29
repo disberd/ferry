@@ -1,17 +1,21 @@
-// Workstation side of the hotkey flow. It waits for Ctrl+Alt+V. On the hotkey it reads the
+// Workstation side of the hotkey flow. The hotkey (Ctrl+Alt+V by default) is registered only while
+// the foreground exe is on the `--apps` list: a foreground event hook and a check at start feed the
+// exe name to `active`, which decides. On the hotkey it reads the
 // clipboard: files (CF_HDROP) first, else the PNG image, else an error sound. `exchange::press`
 // sends them to `ferry serve` over the channel; `serve` types the Remote paths into the focused
 // herdr pane, or the paths go to the clipboard. The press runs on its own thread, so the
-// message loop (and the tray icon) stays live during a transfer. Every step is logged.
+// message loop (and the tray icon) stays live during a transfer. Every press is logged; a focus
+// change is not.
 
 use std::ffi::c_void;
+use crate::active::{Act, Active, Seen};
 use crate::exchange::{self, Item};
 use crate::lifecycle::Opts;
 use crate::link::Link;
 use crate::sounds::{play, Sound};
 use crate::windows::{last_error, log, wide};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 type H = *mut c_void;
@@ -30,6 +34,9 @@ struct Msg {
 #[link(name = "user32")]
 extern "system" {
     fn RegisterHotKey(hwnd: H, id: i32, mods: u32, vk: u32) -> i32;
+    fn UnregisterHotKey(hwnd: H, id: i32) -> i32;
+    fn SetWinEventHook(min: u32, max: u32, module: H, proc_: unsafe extern "system" fn(H, u32, H, i32, i32, u32, u32), pid: u32, tid: u32, flags: u32) -> H;
+    fn GetWindowThreadProcessId(h: H, pid: *mut u32) -> u32;
     fn GetMessageW(msg: *mut Msg, hwnd: H, min: u32, max: u32) -> i32;
     fn DispatchMessageW(msg: *const Msg) -> isize;
     fn OpenClipboard(hwnd: H) -> i32;
@@ -49,6 +56,9 @@ extern "system" {
     fn GlobalUnlock(h: H) -> i32;
     fn GlobalSize(h: H) -> usize;
     fn GlobalAlloc(flags: u32, n: usize) -> H;
+    fn OpenProcess(access: u32, inherit: i32, pid: u32) -> H;
+    fn QueryFullProcessImageNameW(h: H, flags: u32, buf: *mut u16, n: *mut u32) -> i32;
+    fn CloseHandle(h: H) -> i32;
 }
 #[link(name = "shell32")]
 extern "system" {
@@ -58,6 +68,10 @@ const WM_HOTKEY: u32 = 0x0312;
 const MOD_NOREPEAT: u32 = 0x4000;
 const CF_UNICODETEXT: u32 = 13;
 const CF_HDROP: u32 = 15;
+const EVENT_SYSTEM_FOREGROUND: u32 = 3;
+const WINEVENT_OUTOFCONTEXT: u32 = 0;
+const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+const UNKNOWN_EXE: &str = "unknown";
 
 fn format_name(f: u32) -> String {
     let known = [(1, "TEXT"), (2, "BITMAP"), (3, "METAFILEPICT"), (7, "OEMTEXT"), (8, "DIB"), (13, "UNICODETEXT"),
@@ -147,6 +161,25 @@ fn foreground_title() -> String {
     String::from_utf16_lossy(&buf[..n.max(0) as usize])
 }
 
+// The file name of the exe of the foreground window, or `unknown` when Windows gives none:
+// no window, or a process that ferry may not query.
+fn foreground_exe() -> String {
+    let mut pid = 0;
+    unsafe { GetWindowThreadProcessId(GetForegroundWindow(), &mut pid) };
+    let p = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if p.is_null() {
+        return UNKNOWN_EXE.into();
+    }
+    let mut buf = [0u16; 1024];
+    let mut n = buf.len() as u32;
+    let ok = unsafe { QueryFullProcessImageNameW(p, 0, buf.as_mut_ptr(), &mut n) };
+    unsafe { CloseHandle(p) };
+    match String::from_utf16_lossy(&buf[..n as usize]).rsplit('\\').next() {
+        Some(name) if ok != 0 && !name.is_empty() => name.into(),
+        _ => UNKNOWN_EXE.into(),
+    }
+}
+
 // The clipboard as the items of a press. `None` when there is nothing to send: this plays the
 // error sound and logs the cause.
 fn read_items() -> Option<Vec<Item>> {
@@ -193,7 +226,7 @@ fn read_items() -> Option<Vec<Item>> {
 // it may wait for the channel, and the copy goes with it.
 fn on_hotkey(link: &Arc<Link>) {
     let t = Instant::now();
-    log(&format!("HOTKEY, foreground window: {:?}", foreground_title()));
+    log(&format!("HOTKEY, foreground exe {}, window {:?}", foreground_exe(), foreground_title()));
     let ex = exchange::folder();
     let Some(items) = read_items() else {
         // Nothing to send: a press while not connected still starts the connect.
@@ -209,12 +242,58 @@ fn on_hotkey(link: &Arc<Link>) {
     });
 }
 
-// Runs on the thread that calls it: RegisterHotKey binds to that thread.
-pub fn run(o: &Opts, link: &Arc<Link>) {
-    if unsafe { RegisterHotKey(std::ptr::null_mut(), 1, o.mods | MOD_NOREPEAT, o.vk) } == 0 {
-        return log(&format!("FAIL: RegisterHotKey {}, error {} (1409 = another program has it)", o.hotkey, last_error()));
+// What the foreground callback needs: it gets no argument of ours.
+struct Ctx {
+    link: Arc<Link>,
+    key: String,
+    mods: u32,
+    vk: u32,
+    active: Mutex<Active>,
+}
+
+static CTX: OnceLock<Ctx> = OnceLock::new();
+
+// Registers the key when the foreground exe is on the list and releases it otherwise, then
+// tells the link. It runs on the thread of the message loop, as `RegisterHotKey` needs.
+fn check() {
+    let Some(c) = CTX.get() else { return };
+    let exe = foreground_exe();
+    let mut a = c.active.lock().unwrap_or_else(|e| e.into_inner());
+    match a.focus(&exe) {
+        Act::Register => {
+            let ok = unsafe { RegisterHotKey(std::ptr::null_mut(), 1, c.mods | MOD_NOREPEAT, c.vk) } != 0;
+            let err = last_error();
+            let t = a.registered(ok);
+            if t.log {
+                log(&format!("FAIL: RegisterHotKey {}, error {err} (1409 = another program has it)", c.key));
+            }
+            if t.sound {
+                play(Sound::Error);
+            }
+        }
+        Act::Unregister => {
+            unsafe { UnregisterHotKey(std::ptr::null_mut(), 1) };
+            a.unregistered();
+        }
+        Act::Keep => {}
     }
-    log(&format!("ready: press {}", o.hotkey));
+    let on = a.listed(&exe);
+    c.link.focus(Seen { taken: a.taken().then(|| c.key.clone()), exe: Some((exe, on)) });
+}
+
+unsafe extern "system" fn on_focus(_hook: H, _event: u32, _hwnd: H, _object: i32, _child: i32, _thread: u32, _time: u32) {
+    check();
+}
+
+// Runs on the thread that calls it: `RegisterHotKey` binds to that thread, and the
+// out-of-context event hook calls back from the message loop of that thread.
+pub fn run(o: &Opts, link: &Arc<Link>) {
+    let _ = CTX.set(Ctx { link: link.clone(), key: o.hotkey.clone(), mods: o.mods, vk: o.vk, active: Mutex::new(Active::new(&o.apps)) });
+    if unsafe { SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, std::ptr::null_mut(), on_focus, 0, 0, WINEVENT_OUTOFCONTEXT) }.is_null() {
+        return log(&format!("FAIL: SetWinEventHook, error {}", last_error()));
+    }
+    log(&format!("ready: {} while {} has focus", o.hotkey, o.apps.join(", ")));
+    check();
 
     let mut msg: Msg = unsafe { std::mem::zeroed() };
     while unsafe { GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) } > 0 {
