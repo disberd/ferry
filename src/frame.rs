@@ -15,7 +15,6 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const MAGIC: &[u8; 8] = b"\0FERRY\r\n";
 pub const PROTO: &str = "1";
 pub const CHUNK: usize = 64 * 1024;
-#[cfg(windows)]
 pub const CAP: u64 = 512 << 20; // largest single transfer
 pub const PING_S: u64 = 15;
 pub const DEAD_MS: u64 = 45_000;
@@ -32,13 +31,10 @@ pub const BYE: u8 = 8;
 
 // Exit codes of the agent commands. END carries them.
 pub const OK: u8 = 0;
-#[cfg(windows)]
 pub const BAD_PATH: u8 = 2;
 #[cfg(unix)]
 pub const OFFLINE: u8 = 3;
-#[cfg(windows)]
 pub const IN_USE: u8 = 4;
-#[cfg(windows)]
 pub const TOO_LARGE: u8 = 5;
 
 pub fn frame(id: u32, kind: u8, payload: &[u8]) -> Vec<u8> {
@@ -131,7 +127,6 @@ impl Out {
         self.cv.notify_all();
     }
 
-    #[cfg(windows)]
     pub fn dead(&self) -> bool {
         self.q.lock().unwrap().dead
     }

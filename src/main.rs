@@ -3,17 +3,23 @@
 //   Workstation (Windows): start | run | stop | status
 // Both: --version | version
 
+// The Workstation core runs on Linux too, but only the tests use it there.
+#![cfg_attr(not(any(windows, test)), allow(dead_code))]
+
 mod frame;
 #[cfg(unix)]
 mod hkserve;
 #[cfg(unix)]
 mod remote;
-#[cfg(windows)]
 mod exchange;
 #[cfg(windows)]
 mod hotkey;
+#[cfg(not(windows))]
+mod stub;
 #[cfg(windows)]
 mod windows;
+#[cfg(all(test, unix))]
+mod loopback;
 
 const USAGE: &str = "usage: ferry --version | version | serve | ls [dir] | pull <xpath> [local|-] | push <local> [xpath] | hk-serve | hook | start <alias> | run <alias> | stop | status";
 

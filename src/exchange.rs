@@ -2,13 +2,20 @@
 // `ssh.exe -T <alias> ~/.local/bin/ferry serve` and reconnects when it ends.
 // It answers `ls`, `pull` and `push` from agents in the Exchange folder
 // %USERPROFILE%\ferry\.
+//
+// Only `run` and `connect` need Win32. `channel` and everything below it builds
+// on Linux, where the tests run it against `remote::serve_on`.
 
 use crate::frame::*;
+#[cfg(windows)]
 use crate::windows::{hide, log, sound, ssh};
+#[cfg(not(windows))]
+use crate::stub::{log, sound};
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
+#[cfg(windows)]
 use std::process::Child;
 use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
 use std::sync::{Arc, Mutex};
@@ -34,6 +41,7 @@ struct C {
     cancelled: Mutex<HashSet<u32>>,
 }
 
+#[cfg(windows)]
 pub fn run(alias: &str) {
     let remote = "~/.local/bin/ferry serve";
     let host = std::env::var("COMPUTERNAME").unwrap_or_default();
@@ -59,6 +67,7 @@ pub fn run(alias: &str) {
     }
 }
 
+#[cfg(windows)]
 fn connect(alias: &str, remote: &str, host: &str, ex: &Path) -> Result<String, String> {
     let mut child = ssh(alias, remote)
         .spawn()
@@ -69,9 +78,22 @@ fn connect(alias: &str, remote: &str, host: &str, ex: &Path) -> Result<String, S
             log(&format!("  remote: {line}"));
         }
     });
-    let mut stdin = child.stdin.take().unwrap();
-    let mut r = BufReader::with_capacity(CHUNK + 9, child.stdout.take().unwrap());
+    let stdin = child.stdin.take().unwrap();
+    let stdout = child.stdout.take().unwrap();
     let child: Arc<Mutex<Child>> = Arc::new(Mutex::new(child));
+    let ch = child.clone();
+    let why = channel(stdin, stdout, ex, host, move || {
+        let _ = ch.lock().unwrap().kill();
+    });
+    let _ = child.lock().unwrap().kill();
+    let _ = child.lock().unwrap().wait();
+    why
+}
+
+// One connection over any byte channel: the pipes of ssh.exe, or a socket pair
+// in the tests. `stop` ends the channel when the Remote goes silent.
+pub fn channel(mut stdin: impl Write + Send + 'static, r: impl Read, ex: &Path, host: &str, stop: impl Fn() + Send + 'static) -> Result<String, String> {
+    let mut r = BufReader::with_capacity(CHUNK + 9, r);
     stdin.write_all(MAGIC).map_err(|e| e.to_string())?;
     let c = Arc::new(C {
         out: Out::default(),
@@ -83,19 +105,19 @@ fn connect(alias: &str, remote: &str, host: &str, ex: &Path) -> Result<String, S
     c.out.ctrl(0, HELLO, format!("{PROTO}\t{VERSION}\t{host}").as_bytes());
     let c2 = c.clone();
     std::thread::spawn(move || c2.out.run(stdin));
-    let (c2, ch2) = (c.clone(), child.clone());
+    let c2 = c.clone();
     std::thread::spawn(move || {
         let mut n = 0u64;
         while !c2.out.dead() {
             std::thread::sleep(Duration::from_secs(1));
             n += 1;
-            if n % PING_S == 0 {
+            if n.is_multiple_of(PING_S) {
                 c2.out.ctrl(0, PING, b"");
             }
             let silent = now_ms().saturating_sub(c2.rx_ms.load(SeqCst));
             if silent > DEAD_MS {
                 log(&format!("Remote silent for {} s: stop ssh", silent / 1000));
-                let _ = ch2.lock().unwrap().kill();
+                stop();
                 return;
             }
         }
@@ -103,8 +125,6 @@ fn connect(alias: &str, remote: &str, host: &str, ex: &Path) -> Result<String, S
 
     let why = session(&c, &mut r);
     c.out.kill();
-    let _ = child.lock().unwrap().kill();
-    let _ = child.lock().unwrap().wait();
     for (_, p) in c.pushes.lock().unwrap().drain() {
         drop(p.file);
         let _ = fs::remove_file(&p.tmp);
@@ -112,7 +132,7 @@ fn connect(alias: &str, remote: &str, host: &str, ex: &Path) -> Result<String, S
     Ok(why)
 }
 
-fn session(c: &Arc<C>, r: &mut impl Read) -> String {
+fn session(c: &Arc<C>, r: &mut impl BufRead) -> String {
     let mut seen = Vec::new();
     for b in r.by_ref().bytes() {
         match b {
