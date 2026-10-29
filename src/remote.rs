@@ -16,7 +16,7 @@ use std::net::Shutdown;
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::SeqCst};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::SeqCst};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, SystemTime};
 
@@ -284,6 +284,9 @@ struct S {
     presses: Mutex<HashMap<u32, Press>>,
     // The herdr socket, for the paste of a hotkey press.
     herdr: PathBuf,
+    // Set before `BYE replaced`: the old Workstation can close the channel before
+    // the replacement calls `quit`, and the reason must still be the replacement.
+    replaced: AtomicBool,
 }
 
 impl S {
@@ -326,6 +329,7 @@ impl S {
 // Stop all open requests with END 3 and the text `said`, then end `serve`. The flock goes when
 // `serve` returns and the process exits.
 fn quit(s: &S, why: &str, said: &str) {
+    let (why, said) = if s.replaced.load(SeqCst) { (REPLACED, REPLACED) } else { (why, said) };
     s.log(&format!("exit: {why}"));
     // One thread for each agent: stuck agents cost 1 s together, not 1 s each.
     let open: Vec<_> = s.peers.lock().unwrap().drain().collect();
@@ -419,6 +423,7 @@ pub fn serve_with(dir: &Path, herdr: PathBuf, every: Duration, r: impl Read + Se
         inn: dir.join("in"),
         presses: Mutex::default(),
         herdr,
+        replaced: AtomicBool::new(false),
     });
 
     // Handshake. The Workstation skips login noise up to MAGIC.
@@ -529,9 +534,10 @@ fn from_agent(s: &S, mut c: UnixStream) {
     match (role, kind) {
         ("serve", TAKEOVER) => {
             let host = String::from_utf8_lossy(&p).to_string();
+            s.replaced.store(true, SeqCst);
             s.out.ctrl(0, BYE, format!("replaced\t{host}").as_bytes());
             std::thread::sleep(Duration::from_millis(300)); // let the writer send BYE
-            return quit(s, "replaced by a new connection", REPLACED);
+            return quit(s, REPLACED, REPLACED);
         }
         ("hook", ALERT) => return s.out.ctrl(0, ALERT, &p),
         ("cli", OPEN) => {}

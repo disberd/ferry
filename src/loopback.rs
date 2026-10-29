@@ -1832,3 +1832,24 @@ fn a_herdr_frame_on_the_channel_reaches_the_link_and_a_failure_asks_for_the_erro
     let _ = ws.join();
     let _ = fs::remove_dir_all(root);
 }
+
+// The old Workstation closes the channel as soon as it reads `BYE replaced`, before the
+// replacement calls `quit`. The open agent request must still get the replaced text.
+#[test]
+fn a_takeover_gives_the_replaced_text_also_when_the_old_workstation_closes_at_once() {
+    let mut w = FakeWs::start();
+    let mut a = w.agent();
+    a.write_all(&frame(1, OPEN, b"ls\t")).unwrap();
+    assert_eq!(w.next().1, OPEN);
+    let (mut ws2, b) = UnixStream::pair().unwrap();
+    let (st, b2) = (w.state.clone(), b.try_clone().unwrap());
+    let serve2 = std::thread::spawn(move || remote::serve_on(&st, b, b2, false));
+    ws2.write_all(MAGIC).unwrap();
+    ws2.write_all(&frame(0, HELLO, format!("{PROTO}\t0\tnew-host").as_bytes())).unwrap();
+    while w.next().1 != BYE {}
+    w.s.shutdown(std::net::Shutdown::Both).unwrap();
+    let (_, kind, p) = read_frame(&mut a).unwrap();
+    assert_eq!((kind, end_reply(&p)), (END, (OFFLINE, "replaced by a new connection".to_string())));
+    ws2.shutdown(std::net::Shutdown::Both).unwrap();
+    assert_eq!(serve2.join().unwrap(), 0);
+}
