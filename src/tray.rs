@@ -8,7 +8,7 @@ use crate::lifecycle::State;
 use crate::link::{status_text, Icon, Link};
 use crate::windows::{log, wide};
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering::SeqCst};
 use std::sync::{Arc, OnceLock};
 
 type H = *mut c_void;
@@ -56,6 +56,9 @@ struct IconInfo {
     color: H,
 }
 
+#[repr(C)]
+struct Guid(u32, u16, u16, [u8; 8]);
+
 #[link(name = "user32")]
 extern "system" {
     fn RegisterClassW(c: *const WndClass) -> u16;
@@ -72,6 +75,7 @@ extern "system" {
     fn SetForegroundWindow(h: H) -> i32;
     fn GetSystemMetrics(i: i32) -> i32;
     fn SetProcessDpiAwarenessContext(ctx: isize) -> i32;
+    fn RegisterPowerSettingNotification(h: H, setting: *const Guid, flags: u32) -> H;
 }
 #[link(name = "gdi32")]
 extern "system" {
@@ -94,6 +98,10 @@ const WM_LBUTTONUP: usize = 0x202;
 const WM_RBUTTONUP: usize = 0x205;
 const WM_POWERBROADCAST: u32 = 0x218;
 const PBT_APMRESUMEAUTOMATIC: usize = 0x12;
+const PBT_POWERSETTINGCHANGE: usize = 0x8013;
+// The display state: 0 off, 1 on, 2 dimmed. Windows sends it also after Modern
+// Standby, which sends no PBT_APMRESUMEAUTOMATIC.
+const GUID_CONSOLE_DISPLAY_STATE: Guid = Guid(0x6fe6_9556, 0x704a, 0x47a0, [0x8f, 0x24, 0xc2, 0x8d, 0x93, 0x6f, 0xda, 0x47]);
 const NIM_ADD: u32 = 0;
 const NIM_MODIFY: u32 = 1;
 const NIM_DELETE: u32 = 2;
@@ -119,6 +127,9 @@ struct Ctx {
 
 // The window handle as a number, 0 before the window exists.
 static WND: AtomicUsize = AtomicUsize::new(0);
+// The last display state. Windows sends the current state at registration, so
+// the start value 1 (on) keeps that first message from a reset.
+static DISPLAY: AtomicU32 = AtomicU32::new(1);
 static CTX: OnceLock<Ctx> = OnceLock::new();
 
 // The colour of the pixel at (u, v), both in 0..1, or `None` outside the icon.
@@ -244,6 +255,15 @@ unsafe extern "system" fn window_proc(h: H, m: u32, w: usize, l: isize) -> isize
             c.link.reset();
             return 1;
         }
+        WM_POWERBROADCAST if w == PBT_POWERSETTINGCHANGE => {
+            // POWERBROADCAST_SETTING: the GUID (16 bytes), the data length (4), then the data.
+            let state = (l as *const u8).add(20).cast::<u32>().read_unaligned();
+            if DISPLAY.swap(state, SeqCst) == 0 && state == 1 {
+                log("display on: the next wait is 5 s");
+                c.link.reset();
+            }
+            return 1;
+        }
         _ if m == c.created => show(c),
         _ => return DefWindowProcW(h, m, w, l),
     }
@@ -273,6 +293,9 @@ pub fn create(link: Arc<Link>, state: State, log_path: String) {
         return log(&format!("FAIL: hidden window, error {}", crate::windows::last_error()));
     }
     WND.store(h as usize, SeqCst);
+    if unsafe { RegisterPowerSettingNotification(h, &GUID_CONSOLE_DISPLAY_STATE, 0) }.is_null() {
+        log(&format!("FAIL: display state notification, error {}", crate::windows::last_error()));
+    }
     show(c);
 }
 
