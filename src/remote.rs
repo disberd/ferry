@@ -11,7 +11,7 @@
 use crate::frame::*;
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufReader, Read, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::Shutdown;
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -282,6 +282,8 @@ struct S {
     // `in/`, and the hotkey presses that the Workstation streams (odd stream ids).
     inn: PathBuf,
     presses: Mutex<HashMap<u32, Press>>,
+    // The herdr socket, for the paste of a hotkey press.
+    herdr: PathBuf,
 }
 
 impl S {
@@ -375,19 +377,35 @@ fn take_lock(dir: &Path, host: &str, wait: Duration, log: &dyn Fn(&str), kill: &
     lockf
 }
 
-// `serve` on the stdio of the ssh child. `serve_on` has the details.
+// `serve` on the stdio of the ssh child. `serve_with` has the details.
 pub fn serve() -> i32 {
     let d = state();
     let log = d.join("serve.log");
     crate::lifecycle::rotate(&log);
     crate::lifecycle::panic_hook(move |m| crate::lifecycle::append(&log, &format!("{:.3} serve[{}]: {m}\n", now_ms() as f64 / 1000.0, std::process::id())));
-    serve_on(&d, io::stdin(), io::stdout(), true)
+    serve_with(&d, herdr_sock(), io::stdin(), io::stdout(), true)
 }
 
-// Runs one channel: `r` and `w` are the pipes to the Workstation and `dir` is
-// the state folder (it must exist). Returns when the channel or the
+// The default herdr socket, with the rule of herdr for its config folder: `$XDG_CONFIG_HOME`
+// when it is set, else `~/.config`. ferry uses only the default herdr session.
+fn herdr_sock() -> PathBuf {
+    herdr_sock_in(std::env::var_os("XDG_CONFIG_HOME"), std::env::var_os("HOME").unwrap())
+}
+
+pub fn herdr_sock_in(xdg: Option<std::ffi::OsString>, home: std::ffi::OsString) -> PathBuf {
+    xdg.map_or_else(|| PathBuf::from(home).join(".config"), PathBuf::from).join("herdr/herdr.sock")
+}
+
+// `serve_with` for a state folder that has no herdr socket: a press never pastes.
+#[cfg(test)]
+pub fn serve_on(dir: &Path, r: impl Read + Send + 'static, w: impl Write + Send + 'static, echo: bool) -> i32 {
+    serve_with(dir, dir.join("no-herdr.sock"), r, w, echo)
+}
+
+// Runs one channel: `r` and `w` are the pipes to the Workstation, `dir` is
+// the state folder (it must exist) and `herdr` is the herdr socket. Returns when the channel or the
 // replacement ends it. `echo` copies the log lines to stderr.
-pub fn serve_on(dir: &Path, r: impl Read + Send + 'static, mut w: impl Write + Send + 'static, echo: bool) -> i32 {
+pub fn serve_with(dir: &Path, herdr: PathBuf, r: impl Read + Send + 'static, mut w: impl Write + Send + 'static, echo: bool) -> i32 {
     let me = fs::read_to_string("/proc/sys/kernel/hostname").unwrap_or_default().trim().to_string();
     let s = Arc::new(S {
         out: Out::default(),
@@ -400,6 +418,7 @@ pub fn serve_on(dir: &Path, r: impl Read + Send + 'static, mut w: impl Write + S
         ended: Condvar::new(),
         inn: dir.join("in"),
         presses: Mutex::default(),
+        herdr,
     });
 
     // Handshake. The Workstation skips login noise up to MAGIC.
@@ -633,11 +652,56 @@ fn press_cancel(s: &S, id: u32) {
     }
 }
 
-// All files are in place. The paths go back for the clipboard of the Workstation. An attempt to
-// type them into the focused herdr pane goes here, before this reply.
+// All files are in place. `serve` types the paths into the focused herdr pane and replies
+// `pasted`. When that is not possible, the paths go back for the clipboard of the Workstation.
 fn press_done(s: &S, id: u32, p: &Press) {
     let paths: Vec<String> = p.files.iter().map(|(name, _)| p.dir.join(name).display().to_string()).collect();
-    press_end(s, id, OK, &format!("clip {}", paths.join(" ")));
+    let text = paths.join(" ");
+    match paste(&s.herdr, &text) {
+        Ok(()) => press_end(s, id, OK, "pasted"),
+        Err(e) => {
+            s.log(&format!("press {id}: no paste: {e}"));
+            press_end(s, id, OK, &format!("clip {text}"));
+        }
+    }
+}
+
+// Time for each herdr call. herdr answers on its local socket in a few ms, and the channel
+// reader waits for the paste, so a hung herdr costs a press at most 2 calls of this time.
+const HERDR_WAIT: Duration = Duration::from_secs(1);
+
+// `text` into the pane that `pane.current` gives (the last focused pane). herdr types a
+// bracketed paste when the pane asks for it, and presses no Enter.
+fn paste(sock: &Path, text: &str) -> Result<(), String> {
+    let cur = herdr_call(sock, r#"{"id":"1","method":"pane.current","params":{}}"#.into())?;
+    let pane = json_str(&cur, "pane_id").ok_or("no pane")?;
+    herdr_call(sock, format!(r#"{{"id":"2","method":"pane.send_input","params":{{"pane_id":"{}","text":"{}"}}}}"#, json_esc(pane), json_esc(text))).map(drop)
+}
+
+fn json_esc(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+// One call: a new connection, one JSON line out, one line back. The reply must hold a `result`.
+// A Unix connect has no timeout in std, so the whole call runs in a thread and `HERDR_WAIT`
+// limits the wait for it. The thread ends by itself, because its reads and writes time out too.
+fn herdr_call(sock: &Path, req: String) -> Result<String, String> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let sock = sock.to_path_buf();
+    std::thread::spawn(move || {
+        let io = || -> io::Result<String> {
+            let mut c = UnixStream::connect(&sock)?;
+            c.set_write_timeout(Some(HERDR_WAIT))?;
+            c.set_read_timeout(Some(HERDR_WAIT))?;
+            writeln!(c, "{req}")?;
+            let mut line = String::new();
+            BufReader::new(c).read_line(&mut line)?;
+            Ok(line)
+        };
+        drop(tx.send(io()));
+    });
+    let line = rx.recv_timeout(HERDR_WAIT).map_err(|_| "herdr timed out".to_string())?.map_err(|e| format!("herdr socket: {e}"))?;
+    if line.contains("\"result\"") { Ok(line) } else { Err(format!("herdr: {}", line.trim())) }
 }
 
 // Writes `d` into the files. Ok(true) when the last file is in place.

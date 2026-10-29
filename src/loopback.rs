@@ -545,13 +545,19 @@ struct FakeWs {
 
 impl FakeWs {
     fn start() -> FakeWs {
+        FakeWs::start_with("no-herdr.sock")
+    }
+
+    // `herdr` is the file name of the herdr socket in the root folder. Nothing listens on it
+    // until the test binds it.
+    fn start_with(herdr: &str) -> FakeWs {
         let root = temp_root("ws");
         let state = root.join("state");
         fs::DirBuilder::new().recursive(true).mode(0o700).create(&state).unwrap();
         let (mut s, b) = UnixStream::pair().unwrap();
         s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-        let (st, b2) = (state.clone(), b.try_clone().unwrap());
-        let serve = Some(std::thread::spawn(move || remote::serve_on(&st, b, b2, false)));
+        let (st, b2, herdr) = (state.clone(), b.try_clone().unwrap(), root.join(herdr));
+        let serve = Some(std::thread::spawn(move || remote::serve_with(&st, herdr, b, b2, false)));
         s.write_all(MAGIC).unwrap();
         s.write_all(&frame(0, HELLO, format!("{PROTO}\t0\tws").as_bytes())).unwrap();
         let mut m = [0u8; 8];
@@ -1394,4 +1400,91 @@ fn a_hook_with_no_serve_exits_quietly() {
     assert_eq!(remote::hook(&root, r#"{"agent_status":"done","pane_id":"w1:p1"}"#), 0);
     assert!(!root.join("serve.log").exists());
     let _ = fs::remove_dir_all(root);
+}
+
+// How a fake herdr answers one connection.
+enum Herdr {
+    Say(&'static str),
+    Close,
+    Hang,
+}
+
+const PANE: &str = r#"{"id":"1","result":{"type":"pane_info","pane":{"pane_id":"w1:p2","focused":true}}}"#;
+const SENT: &str = r#"{"id":"2","result":{"type":"ok"}}"#;
+
+// A herdr on a Unix socket. Connection n reads one line, records it, and acts as `script[n]`.
+// The returned list holds the request lines in order.
+fn fake_herdr(sock: &Path, script: Vec<Herdr>) -> Arc<Mutex<Vec<String>>> {
+    use std::io::{BufRead, BufReader, Read};
+    let listener = UnixListener::bind(sock).unwrap();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let seen2 = seen.clone();
+    std::thread::spawn(move || {
+        for act in script {
+            let (mut c, _) = listener.accept().unwrap();
+            let mut line = String::new();
+            BufReader::new(c.try_clone().unwrap()).read_line(&mut line).unwrap();
+            seen2.lock().unwrap().push(line.trim_end().to_string());
+            match act {
+                Herdr::Say(r) => writeln!(c, "{r}").unwrap(),
+                Herdr::Close => {}
+                // Wait for the caller to give up and close.
+                Herdr::Hang => while c.read(&mut [0u8; 1]).is_ok_and(|n| n > 0) {},
+            }
+        }
+    });
+    seen
+}
+
+// One press of two files against `serve`. `script` is the fake herdr, or None for a socket that
+// does not exist. Returns the END reply, the request lines that herdr got, and the two paths.
+fn herdr_press(script: Option<Vec<Herdr>>) -> (Reply, Vec<String>, String) {
+    let mut w = FakeWs::start_with("herdr.sock");
+    let seen = script.map(|s| fake_herdr(&w.root.join("herdr.sock"), s)).unwrap_or_default();
+    ws_open(&mut w, 1, &[("a.png", 1), ("b.png", 0)]);
+    w.send(1, DATA, b"x");
+    let reply = ws_end(&mut w, 1);
+    let dir = entries(&w.state).remove(0);
+    let paths = format!("{} {}", dir.join("a.png").display(), dir.join("b.png").display());
+    let seen = seen.lock().unwrap().clone();
+    (reply, seen, paths)
+}
+
+#[test]
+fn a_press_types_the_paths_into_the_focused_pane_and_replies_pasted() {
+    let (reply, seen, paths) = herdr_press(Some(vec![Herdr::Say(PANE), Herdr::Say(SENT)]));
+    assert_eq!(reply, (OK, "pasted".into()));
+    assert_eq!(seen.len(), 2);
+    // The first call names no calling pane, so herdr gives the focused pane.
+    assert!(seen[0].contains(r#""method":"pane.current""#) && seen[0].contains(r#""params":{}"#), "{}", seen[0]);
+    assert!(!seen[0].contains("caller_pane_id"));
+    assert!(seen[1].contains(r#""method":"pane.send_input""#), "{}", seen[1]);
+    assert!(seen[1].contains(&format!(r#""params":{{"pane_id":"w1:p2","text":"{paths}"}}"#)), "{}", seen[1]);
+}
+
+#[test]
+fn a_press_falls_back_to_the_clipboard_when_the_paste_is_not_possible() {
+    let error = r#"{"id":"1","error":{"code":"no_pane","message":"no pane"}}"#;
+    let cases: Vec<(&str, Option<Vec<Herdr>>, usize)> = vec![
+        ("no herdr socket", None, 0),
+        ("no listener on the socket", Some(vec![]), 0),
+        ("pane.current fails", Some(vec![Herdr::Say(error)]), 1),
+        ("pane.current gives no pane", Some(vec![Herdr::Say(r#"{"id":"1","result":{"type":"pane_info"}}"#)]), 1),
+        ("herdr closes with no reply", Some(vec![Herdr::Close]), 1),
+        ("pane.send_input fails", Some(vec![Herdr::Say(PANE), Herdr::Say(error)]), 2),
+        ("herdr hangs", Some(vec![Herdr::Hang]), 1),
+    ];
+    for (what, script, calls) in cases {
+        let (reply, seen, paths) = herdr_press(script);
+        assert_eq!(reply, (OK, format!("clip {paths}")), "{what}");
+        assert_eq!(seen.len(), calls, "{what}");
+    }
+}
+
+#[test]
+fn the_herdr_socket_follows_the_config_folder_rule_of_herdr() {
+    // `herdr_sock` reads the environment, and tests must not change it: check the rule on its
+    // two inputs through the pure part.
+    assert_eq!(remote::herdr_sock_in(Some("/x".into()), "/h".into()), Path::new("/x/herdr/herdr.sock"));
+    assert_eq!(remote::herdr_sock_in(None, "/h".into()), Path::new("/h/.config/herdr/herdr.sock"));
 }
