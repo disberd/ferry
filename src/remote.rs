@@ -198,7 +198,11 @@ fn take_lock(dir: &Path, host: &str, wait: Duration, log: &dyn Fn(&str), kill: &
 
 // `serve` on the stdio of the ssh child. `serve_on` has the details.
 pub fn serve() -> i32 {
-    serve_on(&state(), io::stdin(), io::stdout(), true)
+    let d = state();
+    let log = d.join("serve.log");
+    crate::lifecycle::rotate(&log);
+    crate::lifecycle::panic_hook(move |m| crate::lifecycle::append(&log, &format!("{:.3} serve[{}]: {m}\n", now_ms() as f64 / 1000.0, std::process::id())));
+    serve_on(&d, io::stdin(), io::stdout(), true)
 }
 
 // Runs one channel: `r` and `w` are the pipes to the Workstation and `dir` is

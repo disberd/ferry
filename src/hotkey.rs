@@ -6,6 +6,7 @@
 // paths go to the clipboard. Every step is logged.
 
 use std::ffi::c_void;
+use crate::lifecycle::Opts;
 use crate::sounds::{play, Sound};
 use crate::windows::{last_error, log, ssh, wide};
 use std::io::{BufRead, BufReader, Write};
@@ -53,8 +54,6 @@ extern "system" {
     fn DragQueryFileW(h: H, i: u32, buf: *mut u16, n: u32) -> u32;
 }
 const WM_HOTKEY: u32 = 0x0312;
-const MOD_ALT: u32 = 0x1;
-const MOD_CONTROL: u32 = 0x2;
 const MOD_NOREPEAT: u32 = 0x4000;
 const CF_UNICODETEXT: u32 = 13;
 const CF_HDROP: u32 = 15;
@@ -156,11 +155,11 @@ struct Conn {
 
 fn connect(alias: &str) -> std::io::Result<Conn> {
     log(&format!("connect: {alias} {REMOTE}"));
-    let mut child = ssh(alias, REMOTE).spawn()?;
+    let mut child = ssh(alias, REMOTE)?;
     let stderr = child.stderr.take().unwrap();
     std::thread::spawn(move || {
         for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-            log(&format!("  remote stderr: {line}"));
+            log(&format!("ssh: {line}"));
         }
     });
     Ok(Conn { stdin: child.stdin.take().unwrap(), stdout: BufReader::new(child.stdout.take().unwrap()), _child: child })
@@ -255,9 +254,10 @@ fn on_hotkey(conn: &mut Option<Conn>, alias: &str) {
 }
 
 // Runs on the thread that calls it: RegisterHotKey binds to that thread.
-pub fn run(alias: &str) {
-    if unsafe { RegisterHotKey(std::ptr::null_mut(), 1, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'V' as u32) } == 0 {
-        return log(&format!("FAIL: RegisterHotKey Ctrl+Alt+V, error {} (1409 = another program has it)", last_error()));
+pub fn run(o: &Opts) {
+    let alias = &o.alias;
+    if unsafe { RegisterHotKey(std::ptr::null_mut(), 1, o.mods | MOD_NOREPEAT, o.vk) } == 0 {
+        return log(&format!("FAIL: RegisterHotKey {}, error {} (1409 = another program has it)", o.hotkey, last_error()));
     }
     let mut conn = match connect(alias) {
         Ok(c) => Some(c),
@@ -266,7 +266,7 @@ pub fn run(alias: &str) {
             None
         }
     };
-    log("ready: press Ctrl+Alt+V");
+    log(&format!("ready: press {}", o.hotkey));
 
     let mut msg: Msg = unsafe { std::mem::zeroed() };
     while unsafe { GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) } > 0 {

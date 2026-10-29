@@ -71,12 +71,11 @@ pub fn run(alias: &str) {
 #[cfg(windows)]
 fn connect(alias: &str, remote: &str, host: &str, ex: &Path) -> Result<String, String> {
     let mut child = ssh(alias, remote)
-        .spawn()
         .map_err(|e| format!("spawn: {e}"))?;
     let stderr = child.stderr.take().unwrap();
     std::thread::spawn(move || {
         for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-            log(&format!("  remote: {line}"));
+            log(&format!("ssh: {line}"));
         }
     });
     let stdin = child.stdin.take().unwrap();

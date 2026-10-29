@@ -7,6 +7,7 @@
 #![cfg_attr(not(any(windows, test)), allow(dead_code))]
 
 mod frame;
+mod lifecycle;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod sounds;
 #[cfg(unix)]
@@ -23,7 +24,19 @@ mod windows;
 #[cfg(all(test, unix))]
 mod loopback;
 
-const USAGE: &str = "usage: ferry --version | version | serve | ls [dir] | pull <xpath> [local|-] | push <local> [xpath] | hk-serve | hook | start <alias> | run <alias> | stop | status";
+const USAGE: &str = "usage: ferry --version | version | serve | ls [dir] | pull <xpath> [local|-] | push <local> [xpath] | hk-serve | hook | start <alias> [--hotkey <key>] [--apps <exe>,<exe>] | run <alias> [--hotkey <key>] [--apps <exe>,<exe>] | stop | status";
+
+// Checks the options of `start` and `run` before anything starts.
+#[cfg(windows)]
+fn with_opts(args: &[&str], f: fn(&lifecycle::Opts) -> i32) -> i32 {
+    match lifecycle::parse(args) {
+        Ok(o) => f(&o),
+        Err(e) => {
+            eprintln!("ferry: {e}");
+            2
+        }
+    }
+}
 
 fn main() {
     let a: Vec<String> = std::env::args().skip(1).collect();
@@ -53,9 +66,9 @@ fn main() {
             0
         }
         #[cfg(windows)]
-        ["start", alias] => windows::start(alias),
+        ["start", ref r @ ..] => with_opts(r, windows::start),
         #[cfg(windows)]
-        ["run", alias] => windows::run(alias),
+        ["run", ref r @ ..] => with_opts(r, windows::run),
         #[cfg(windows)]
         ["stop"] => windows::stop(),
         #[cfg(windows)]
