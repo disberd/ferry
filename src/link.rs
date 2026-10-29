@@ -87,7 +87,7 @@ impl Chan {
 
 // What `ferry run` stores in the state file after the first line, and what
 // `ferry status` prints. Each text is the part after its label.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Report {
     // `HH:MM` of the process start and of this change.
     pub since: String,
@@ -117,6 +117,64 @@ impl Report {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Icon {
+    Normal,
+    Grey,
+    // Normal with a red dot: the user must act.
+    Alert,
+}
+
+// What the tray icon shows: the icon and the hover line.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Tray {
+    pub icon: Icon,
+    pub tip: String,
+}
+
+// The most UTF-16 units of a hover line; the Win32 `szTip` holds 128 with its end mark.
+const TIP_MAX: usize = 127;
+
+// Whole minutes from `since` to `now`, both `HH:MM`. ponytail: wraps after 24 h; the
+// hover then shows a short time until the next state change.
+fn minutes(since: &str, now: &str) -> u32 {
+    let m = |t: &str| t.split_once(':').and_then(|(h, m)| Some(h.parse::<u32>().ok()? * 60 + m.parse::<u32>().ok()?)).unwrap_or(0);
+    (m(now) + 1440 - m(since)) % 1440
+}
+
+// The icon and the hover line of a channel state. `now` is the local `HH:MM`.
+pub fn tray(chan: &Chan, alias: &str, now: &str) -> Tray {
+    let state = match chan {
+        Chan::Connecting => format!("connecting to {alias}"),
+        Chan::Connected { .. } => format!("connected to {alias}"),
+        Chan::Offline { since, detail, .. } => match minutes(since, now) {
+            0 => format!("offline: {detail}"),
+            n => format!("offline {n} min: {detail}"),
+        },
+        Chan::Mismatch { .. } | Chan::Replaced { .. } => chan.text(alias),
+    };
+    // The reasons that need the user to act, worst first. A new reason is one more line here.
+    let mut act: Vec<&str> = Vec::new();
+    if matches!(chan, Chan::Mismatch { .. } | Chan::Replaced { .. }) {
+        act.push(&state);
+    }
+    let icon = match (act.is_empty(), chan) {
+        (false, _) => Icon::Alert,
+        (true, Chan::Connected { .. }) => Icon::Normal,
+        (true, _) => Icon::Grey,
+    };
+    let line = format!("ferry · {}", act.first().copied().unwrap_or(&state)).replace(['\r', '\n'], " ");
+    let (mut tip, mut units) = (String::new(), 0);
+    for c in line.chars() {
+        units += c.len_utf16();
+        if units > TIP_MAX {
+            break;
+        }
+        tip.push(c);
+    }
+    Tray { icon, tip }
+}
+
 #[derive(Clone, Copy, PartialEq)]
 enum Kick {
     Reset,
@@ -131,6 +189,8 @@ struct Inner {
     // The protocol integer of a mismatched `HELLO` on this connection.
     mismatch: Option<String>,
     kick: Option<Kick>,
+    // The report and the tray view of the last change.
+    last: Option<(Report, Tray)>,
 }
 
 // The state of the channel. The connect loop changes it; the hotkey and the
@@ -149,21 +209,29 @@ impl Link {
     // `hotkey` is the text after `hotkey: `. `clock` gives the local `HH:MM`.
     // `sink` gets the report at each state change.
     pub fn new(alias: &str, hotkey: &str, clock: fn() -> String, sink: impl Fn(&Report) + Send + Sync + 'static) -> Link {
-        let m = Inner { chan: Chan::Connecting, backoff: Backoff::default(), down: None, mismatch: None, kick: None };
+        let m = Inner { chan: Chan::Connecting, backoff: Backoff::default(), down: None, mismatch: None, kick: None, last: None };
         Link { alias: alias.into(), hotkey: hotkey.into(), since: clock(), clock, sink: Box::new(sink), m: Mutex::new(m), cv: Condvar::new() }
     }
 
     fn set(&self, g: &mut Inner, chan: Chan) {
         let connected = matches!(chan, Chan::Connected { .. });
+        let now = (self.clock)();
         g.chan = chan;
-        (self.sink)(&Report {
+        let rep = Report {
             since: self.since.clone(),
-            changed: (self.clock)(),
+            changed: now.clone(),
             connected,
             channel: g.chan.text(&self.alias).replace(['\r', '\n'], " "),
             herdr: if connected { "unknown" } else { "unknown (offline)" }.into(),
             hotkey: self.hotkey.clone(),
-        });
+        };
+        (self.sink)(&rep);
+        g.last = Some((rep, tray(&g.chan, &self.alias, &now)));
+    }
+
+    // The report and the tray view of the last change, or `None` before the first.
+    pub fn view(&self) -> Option<(Report, Tray)> {
+        self.m.lock().unwrap().last.clone()
     }
 
     #[cfg(test)]
@@ -247,7 +315,6 @@ impl Link {
 
     // The PC woke from sleep: the next wait is 5 s again. A channel that waits
     // after `BYE replaced` stays as it is.
-    #[allow(dead_code)]
     pub fn reset(&self) {
         let mut g = self.m.lock().unwrap();
         g.backoff.reset();
@@ -529,5 +596,61 @@ mod tests {
     fn status_names_both_versions_when_they_differ() {
         let (t, _) = status_text("1.1.0", Some(&state("1.0.0")), true, Some(&report("c", true)), "log");
         assert_eq!(t.lines().next().unwrap(), "ferry 1.1.0 (this exe) · running ferry 1.0.0, pid 20892, since 09:12");
+    }
+
+    fn offline(since: &str, detail: &str) -> Chan {
+        Chan::Offline { since: since.into(), detail: detail.into(), wait: 5 }
+    }
+
+    #[test]
+    fn the_icon_follows_the_channel() {
+        let c = Chan::Connected { since: "09:12".into(), version: "1.0.0".into() };
+        let icon = |c: &Chan| tray(c, "a", "09:30").icon;
+        assert_eq!(icon(&c), Icon::Normal);
+        assert_eq!(icon(&Chan::Connecting), Icon::Grey);
+        assert_eq!(icon(&offline("09:12", "x")), Icon::Grey);
+        assert_eq!(icon(&Chan::Mismatch { remote: "1".into(), wait: 5 }), Icon::Alert);
+        assert_eq!(icon(&Chan::Replaced { host: "b".into() }), Icon::Alert);
+    }
+
+    #[test]
+    fn the_hover_names_the_state_and_the_time_offline() {
+        let tip = |c: &Chan| tray(c, "work", "09:24").tip;
+        assert_eq!(tip(&Chan::Connected { since: "09:12".into(), version: "1.0.0".into() }), "ferry · connected to work");
+        assert_eq!(tip(&Chan::Connecting), "ferry · connecting to work");
+        assert_eq!(tip(&offline("09:12", "Could not resolve hostname")), "ferry · offline 12 min: Could not resolve hostname");
+        assert_eq!(tip(&offline("09:24", "x")), "ferry · offline: x");
+        assert_eq!(tip(&offline("23:50", "x")), "ferry · offline 574 min: x");
+        assert_eq!(tip(&offline("09:50", "x")), "ferry · offline 1414 min: x");
+    }
+
+    #[test]
+    fn the_hover_of_a_user_action_is_the_channel_line() {
+        for c in [Chan::Mismatch { remote: "1".into(), wait: 20 }, Chan::Replaced { host: "other".into() }] {
+            assert_eq!(tray(&c, "work", "09:24").tip, format!("ferry · {}", c.text("work")));
+        }
+    }
+
+    #[test]
+    fn the_hover_fits_the_win32_limit() {
+        // 127 UTF-16 units at most, and never a cut inside a character.
+        for detail in ["x".repeat(500), "é".repeat(500), "😀".repeat(500), format!("a\nb\r\n{}", "y".repeat(300))] {
+            let tip = tray(&offline("09:12", &detail), "work", "09:24").tip;
+            let units = tip.encode_utf16().count();
+            assert!((126..=127).contains(&units), "{units}");
+            assert!(!tip.contains(['\r', '\n']));
+        }
+    }
+
+    #[test]
+    fn the_link_keeps_the_last_view_for_the_tray() {
+        let (l, _) = link();
+        assert_eq!(l.view(), None);
+        l.connecting();
+        assert_eq!(l.view().unwrap().1, Tray { icon: Icon::Grey, tip: "ferry · connecting to alias".into() });
+        hello(&l, PROTO);
+        let (r, t) = l.view().unwrap();
+        assert!(r.connected);
+        assert_eq!(t.icon, Icon::Normal);
     }
 }

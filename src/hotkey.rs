@@ -31,6 +31,7 @@ struct Msg {
 extern "system" {
     fn RegisterHotKey(hwnd: H, id: i32, mods: u32, vk: u32) -> i32;
     fn GetMessageW(msg: *mut Msg, hwnd: H, min: u32, max: u32) -> i32;
+    fn DispatchMessageW(msg: *const Msg) -> isize;
     fn OpenClipboard(hwnd: H) -> i32;
     fn CloseClipboard() -> i32;
     fn EmptyClipboard() -> i32;
@@ -272,6 +273,17 @@ pub fn run(o: &Opts) {
     while unsafe { GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) } > 0 {
         if msg.message == WM_HOTKEY {
             on_hotkey(&mut conn, alias);
+        } else {
+            unsafe { DispatchMessageW(&msg) };
         }
+    }
+}
+
+// The message loop for a process whose hotkey is not registered: the hidden
+// window of the tray icon still needs its messages.
+pub fn pump() {
+    let mut msg: Msg = unsafe { std::mem::zeroed() };
+    while unsafe { GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) } > 0 {
+        unsafe { DispatchMessageW(&msg) };
     }
 }

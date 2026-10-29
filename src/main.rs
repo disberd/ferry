@@ -18,6 +18,8 @@ mod remote;
 mod exchange;
 #[cfg(windows)]
 mod hotkey;
+#[cfg(windows)]
+mod tray;
 #[cfg(not(windows))]
 mod stub;
 #[cfg(windows)]

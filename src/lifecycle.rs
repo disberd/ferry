@@ -110,6 +110,7 @@ fn parse_apps(s: &str) -> Result<Vec<String>, String> {
 // The state file: the first line holds the pid, the start time of the process
 // (the `FILETIME` of its creation) and the build version, separated by TAB.
 // Later lines belong to the status text.
+#[derive(Clone)]
 pub struct State {
     pub pid: u32,
     pub start: u64,

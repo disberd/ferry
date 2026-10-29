@@ -2,7 +2,7 @@
 // `hotkey`.
 //   start <alias> [--hotkey K] [--apps a,b]
 //                  start a detached `run` with the same arguments
-//   run <alias> ...  the Exchange folder loop (thread) and the hotkey (main thread)
+//   run <alias> ...  the Exchange folder loop (thread), the hotkey and the tray icon (main thread)
 //   stop           end the running `run`; its ssh.exe children end with it
 //   status         show the state of `run` in five lines; exit 0 when connected
 // State in %LOCALAPPDATA%\ferry\: ferry.log (and ferry.log.1), state (pid,
@@ -226,17 +226,21 @@ pub fn run(o: &Opts) -> i32 {
     }
     let exe = std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_default();
     log(&format!("ferry {} run {} exe {exe}, hotkey {}, apps {}", crate::frame::VERSION, o.alias, o.hotkey, o.apps.join(",")));
-    let link = Link::new(&o.alias, &format!("{} for {}", o.hotkey, o.apps.join(", ")), local_hhmm, move |r| {
-        log(&format!("channel: {}", r.channel));
-        write_state(&s, r);
-    });
+    let link = std::sync::Arc::new(Link::new(&o.alias, &format!("{} for {}", o.hotkey, o.apps.join(", ")), local_hhmm, {
+        let s = s.clone();
+        move |r| {
+            log(&format!("channel: {}", r.channel));
+            write_state(&s, r);
+            crate::tray::changed();
+        }
+    }));
+    crate::tray::create(link.clone(), s, dir().join("ferry.log").display().to_string());
     let a = o.alias.clone();
     std::thread::spawn(move || crate::exchange::run(&a, &link));
     crate::hotkey::run(o);
-    // No hotkey: the Exchange folder loop keeps the process alive.
-    loop {
-        std::thread::park();
-    }
+    // No hotkey: the window of the tray icon still needs its messages.
+    crate::hotkey::pump();
+    1
 }
 
 pub fn stop() -> i32 {
