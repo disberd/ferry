@@ -323,11 +323,18 @@ impl Link {
     }
 
     // Connect at once, also after `BYE replaced`.
-    #[allow(dead_code)]
     pub fn connect_now(&self) {
         let mut g = self.m.lock().unwrap();
         g.kick = Some(Kick::Now);
         self.cv.notify_all();
+    }
+
+    // A hotkey press with no live channel. A connect that runs already needs no kick: a kick
+    // then would skip the wait after that connect ends.
+    pub fn press(&self) {
+        if !matches!(self.m.lock().unwrap().chan, Chan::Connecting) {
+            self.connect_now();
+        }
     }
 }
 
@@ -486,6 +493,20 @@ mod tests {
         l.connecting();
         l.pause(Some(0));
         assert!(l.m.lock().unwrap().kick.is_none());
+    }
+
+    #[test]
+    fn a_press_connects_at_once_unless_a_connect_runs() {
+        let (l, _) = link();
+        l.connecting();
+        l.press();
+        assert!(l.m.lock().unwrap().kick.is_none());
+        for why in ["ssh ended before HELLO", "replaced\tother-host"] {
+            l.ended(why, "");
+            l.press();
+            assert!(l.m.lock().unwrap().kick.is_some(), "{why}");
+            l.connecting();
+        }
     }
 
     #[test]

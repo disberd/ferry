@@ -7,9 +7,11 @@
 use std::ffi::c_void;
 use crate::exchange::{self, Item};
 use crate::lifecycle::Opts;
+use crate::link::Link;
 use crate::sounds::{play, Sound};
 use crate::windows::{last_error, log, wide};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Instant;
 
 type H = *mut c_void;
@@ -145,27 +147,30 @@ fn foreground_title() -> String {
     String::from_utf16_lossy(&buf[..n.max(0) as usize])
 }
 
-fn on_hotkey() {
-    let t = Instant::now();
-    log(&format!("HOTKEY, foreground window: {:?}", foreground_title()));
+// The clipboard as the items of a press. `None` when there is nothing to send: this plays the
+// error sound and logs the cause.
+fn read_items() -> Option<Vec<Item>> {
     let (clip, formats) = match read_clipboard() {
         Ok(c) => c,
         Err(e) => {
             log(&format!("  FAIL: {e}"));
-            return play(Sound::Error);
+            play(Sound::Error);
+            return None;
         }
     };
     log(&format!("  clipboard formats: {}", formats.join(", ")));
     let items: Vec<Item> = match clip {
         Clip::Nothing => {
             log("  nothing to send (no HDROP, no PNG)");
-            return play(Sound::Error);
+            play(Sound::Error);
+            return None;
         }
         Clip::Png(data) => vec![Item::mem("screenshot.png", data)],
         Clip::Files(files) => {
             if let Some(dir) = files.iter().find(|p| p.is_dir()) {
                 log(&format!("  REFUSED: folder {}", dir.display()));
-                return play(Sound::Error);
+                play(Sound::Error);
+                return None;
             }
             let mut v = Vec::new();
             for p in &files {
@@ -173,24 +178,39 @@ fn on_hotkey() {
                     Ok(i) => v.push(i),
                     Err(e) => {
                         log(&format!("  FAIL: read {}: {e}", p.display()));
-                        return play(Sound::Error);
+                        play(Sound::Error);
+                        return None;
                     }
                 }
             }
             v
         }
     };
+    Some(items)
+}
+
+// The copy of the clipboard is read here, at the press. The press itself runs on its own thread:
+// it may wait for the channel, and the copy goes with it.
+fn on_hotkey(link: &Arc<Link>) {
+    let t = Instant::now();
+    log(&format!("HOTKEY, foreground window: {:?}", foreground_title()));
+    let ex = exchange::folder();
+    let Some(items) = read_items() else {
+        // Nothing to send: a press while not connected still starts the connect.
+        return exchange::start_connect(&ex, || link.press());
+    };
     let bytes: u64 = items.iter().map(|i| i.size).sum();
     let names: Vec<&str> = items.iter().map(|i| i.name.as_str()).collect();
     log(&format!("  {} item(s), {bytes} B: {}", items.len(), names.join(", ")));
+    let link = link.clone();
     std::thread::spawn(move || {
-        exchange::press(&exchange::folder(), &items, set_clipboard_text);
+        exchange::press(&ex, &items, exchange::HELLO_WAIT, || link.press(), set_clipboard_text);
         log(&format!("  hotkey to reply {} ms", t.elapsed().as_millis()));
     });
 }
 
 // Runs on the thread that calls it: RegisterHotKey binds to that thread.
-pub fn run(o: &Opts) {
+pub fn run(o: &Opts, link: &Arc<Link>) {
     if unsafe { RegisterHotKey(std::ptr::null_mut(), 1, o.mods | MOD_NOREPEAT, o.vk) } == 0 {
         return log(&format!("FAIL: RegisterHotKey {}, error {} (1409 = another program has it)", o.hotkey, last_error()));
     }
@@ -199,7 +219,7 @@ pub fn run(o: &Opts) {
     let mut msg: Msg = unsafe { std::mem::zeroed() };
     while unsafe { GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) } > 0 {
         if msg.message == WM_HOTKEY {
-            on_hotkey();
+            on_hotkey(link);
         } else {
             unsafe { DispatchMessageW(&msg) };
         }

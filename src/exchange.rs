@@ -167,6 +167,7 @@ pub fn channel(mut stdin: impl Write + Send + 'static, r: impl Read, ex: &Path, 
             if f[0] == PROTO {
                 log(&format!("HELLO {}: ready", f.join(" ")));
                 LIVE.lock().unwrap().insert(ex.to_path_buf(), c.clone());
+                LIVE_UP.notify_all();
                 let why = session(&c, &mut r);
                 let mut live = LIVE.lock().unwrap();
                 if live.get(ex).is_some_and(|l| Arc::ptr_eq(l, &c)) {
@@ -512,11 +513,29 @@ pub fn folder() -> PathBuf {
 }
 
 // The channel of each Exchange folder, from its `HELLO` to its end. A press finds its channel here.
+// Only a `HELLO` with the same protocol integer puts a channel in. `LIVE_UP` wakes the presses
+// that wait for one.
 static LIVE: Mutex<std::collections::BTreeMap<PathBuf, Arc<C>>> = Mutex::new(std::collections::BTreeMap::new());
+static LIVE_UP: Condvar = Condvar::new();
 
-#[cfg(test)]
+// The newest press of each Exchange folder, by number. A press that waits for a channel gives
+// up its copy when a newer press exists: only the newest copy of the clipboard is ever sent.
+static LATEST: Mutex<std::collections::BTreeMap<PathBuf, u64>> = Mutex::new(std::collections::BTreeMap::new());
+static PRESSES: AtomicU64 = AtomicU64::new(0);
+
+// How long a press waits for a matching `HELLO` before it drops its copy.
+#[cfg(windows)]
+pub const HELLO_WAIT: Duration = Duration::from_secs(10);
+
 pub fn connected(ex: &Path) -> bool {
     LIVE.lock().unwrap().contains_key(ex)
+}
+
+// A press, also one with nothing to send: calls `connect` when no channel is up.
+pub fn start_connect(ex: &Path, connect: impl FnOnce()) {
+    if !connected(ex) {
+        connect();
+    }
 }
 
 // A press holds at most this many files.
@@ -554,16 +573,48 @@ pub enum Outcome {
     Clip(Vec<String>),
     // The cause is in the text; the press gave the error sound.
     Failed(String),
+    // A newer press took over while this one waited for the channel. This one sent nothing and
+    // gave no sound.
+    Superseded,
+}
+
+// The channel for a press: at once when it is up, else when a matching `HELLO` comes within
+// `wait`. `Err` is the end of the press: the wait ran out, or a newer press took over.
+fn await_channel(ex: &Path, wait: Duration) -> Result<Arc<C>, Outcome> {
+    let end = Instant::now() + wait;
+    let me = PRESSES.fetch_add(1, SeqCst);
+    let mut live = LIVE.lock().unwrap();
+    LATEST.lock().unwrap().insert(ex.to_path_buf(), me);
+    LIVE_UP.notify_all(); // an older press that waits sees that it is not the newest
+    loop {
+        if LATEST.lock().unwrap().get(ex) != Some(&me) {
+            return Err(Outcome::Superseded);
+        }
+        if let Some(c) = live.get(ex) {
+            return Ok(c.clone());
+        }
+        let left = end.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(Outcome::Failed(format!("press: no HELLO within {wait:?}, the copy is dropped")));
+        }
+        live = LIVE_UP.wait_timeout(live, left).unwrap().0;
+    }
 }
 
 // One hotkey press: sends `items` over the channel of the Exchange folder `ex`, waits for the
-// reply and acts on it. `set_clip` puts text on the clipboard of the Workstation; it gets the
+// reply and acts on it. With no channel up it calls `connect` and holds the copy in `items` until
+// a matching `HELLO` comes, but for `wait` at most; then it drops the copy, so an old clipboard is
+// never sent later. `set_clip` puts text on the clipboard of the Workstation; it gets the
 // paths of a `clip` reply that passed the clip check. This plays the sound and logs the cause of
 // a failure. It blocks until the reply, so a caller keeps it off its message loop.
-pub fn press(ex: &Path, items: &[Item], set_clip: impl FnOnce(&str) -> bool) -> Outcome {
-    let out = send(ex, items);
+pub fn press(ex: &Path, items: &[Item], wait: Duration, connect: impl FnOnce(), set_clip: impl FnOnce(&str) -> bool) -> Outcome {
+    start_connect(ex, connect);
+    let out = match await_channel(ex, wait) {
+        Ok(c) => send(&c, items),
+        Err(out) => out,
+    };
     match &out {
-        Outcome::Pasted => {}
+        Outcome::Pasted | Outcome::Superseded => {}
         Outcome::Clip(paths) => {
             let text = paths.join(" ");
             let ok = set_clip(&text);
@@ -578,8 +629,7 @@ pub fn press(ex: &Path, items: &[Item], set_clip: impl FnOnce(&str) -> bool) -> 
     out
 }
 
-fn send(ex: &Path, items: &[Item]) -> Outcome {
-    let Some(c) = LIVE.lock().unwrap().get(ex).cloned() else { return Outcome::Failed("press: no channel to the Remote".into()) };
+fn send(c: &Arc<C>, items: &[Item]) -> Outcome {
     let mut open = format!("hotkey\t{}", items.len());
     for it in items {
         open += &format!("\t{}\t{}", it.name.replace('\t', "_"), it.size);
@@ -591,7 +641,7 @@ fn send(ex: &Path, items: &[Item]) -> Outcome {
     c.presses.lock().unwrap().insert(id, None);
     c.out.ctrl(id, OPEN, open.as_bytes());
     log(&format!("{id}: OPEN hotkey, {} files", items.len()));
-    if let Err(why) = feed(&c, id, items) {
+    if let Err(why) = feed(c, id, items) {
         c.out.ctrl(id, CANCEL, b"");
         c.presses.lock().unwrap().remove(&id);
         return Outcome::Failed(format!("press {id}: {why}, CANCEL"));

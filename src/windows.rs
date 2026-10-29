@@ -236,8 +236,9 @@ pub fn run(o: &Opts) -> i32 {
     }));
     crate::tray::create(link.clone(), s, dir().join("ferry.log").display().to_string());
     let a = o.alias.clone();
-    std::thread::spawn(move || crate::exchange::run(&a, &link));
-    crate::hotkey::run(o);
+    let l = link.clone();
+    std::thread::spawn(move || crate::exchange::run(&a, &l));
+    crate::hotkey::run(o, &link);
     // No hotkey: the window of the tray icon still needs its messages.
     crate::hotkey::pump();
     1

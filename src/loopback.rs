@@ -1025,7 +1025,7 @@ fn is_stamp(name: &str) -> bool {
 fn pressed(l: &Loop, items: &[Item]) -> (Outcome, Option<String>) {
     wait_for("channel", || exchange::connected(&l.ex));
     let mut clip = None;
-    let out = exchange::press(&l.ex, items, |t| {
+    let out = exchange::press(&l.ex, items, Duration::ZERO, || {}, |t| {
         clip = Some(t.to_string());
         true
     });
@@ -1126,7 +1126,7 @@ fn a_press_over_the_limits_is_refused_and_sends_nothing() {
     let many: Vec<Item> = (0..101).map(|i| Item::mem(&format!("f{i}"), vec![])).collect();
     let long: Vec<Item> = (0..100).map(|i| Item::mem(&format!("{i}{}", "n".repeat(700)), vec![])).collect();
     for items in [many, long] {
-        let out = exchange::press(&r.ex, &items, |_| panic!("clipboard"));
+        let out = exchange::press(&r.ex, &items, Duration::ZERO, || {}, |_| panic!("clipboard"));
         assert!(matches!(&out, Outcome::Failed(w) if w.starts_with("press refused")), "{out:?}");
     }
     r.quiet();
@@ -1134,7 +1134,7 @@ fn a_press_over_the_limits_is_refused_and_sends_nothing() {
 
 #[test]
 fn a_press_with_no_channel_fails() {
-    let out = exchange::press(Path::new("/no-such-exchange-folder"), &[Item::mem("a", vec![1])], |_| panic!("clipboard"));
+    let out = exchange::press(Path::new("/no-such-exchange-folder"), &[Item::mem("a", vec![1])], Duration::ZERO, || {}, |_| panic!("clipboard"));
     assert!(matches!(out, Outcome::Failed(_)));
 }
 
@@ -1245,7 +1245,7 @@ fn answered(code: u8, text: &str) -> (Outcome, Option<String>) {
     let clip2 = clip.clone();
     let h = std::thread::spawn(move || {
         wait_for("channel", || exchange::connected(&ex));
-        exchange::press(&ex, &[Item::mem("a.png", b"abc".to_vec())], move |t| {
+        exchange::press(&ex, &[Item::mem("a.png", b"abc".to_vec())], Duration::ZERO, || {}, move |t| {
             *clip2.lock().unwrap() = Some(t.to_string());
             true
         })
@@ -1293,7 +1293,7 @@ fn a_file_that_is_shorter_or_unreadable_gives_cancel_and_the_error() {
     for (n, (path, size)) in [(short, 10), (r.root.join("gone"), 5)].into_iter().enumerate() {
         let id = 1 + 2 * n as u32;
         let item = Item { name: "f.bin".into(), size, src: Src::File(path) };
-        let out = exchange::press(&r.ex, &[item], |_| panic!("clipboard"));
+        let out = exchange::press(&r.ex, &[item], Duration::ZERO, || {}, |_| panic!("clipboard"));
         assert!(matches!(out, Outcome::Failed(_)), "{out:?}");
         // OPEN, then maybe DATA, then CANCEL, and no END.
         let (i, kind, _) = r.next();
@@ -1334,7 +1334,7 @@ fn the_workstation_stops_sending_data_after_an_end() {
     let ex = r.ex.clone();
     let h = std::thread::spawn(move || {
         wait_for("channel", || exchange::connected(&ex));
-        exchange::press(&ex, &[Item::file(&big).unwrap()], |_| panic!("clipboard"))
+        exchange::press(&ex, &[Item::file(&big).unwrap()], Duration::ZERO, || {}, |_| panic!("clipboard"))
     });
     let (id, kind, _) = r.next();
     assert_eq!(kind, OPEN);
@@ -1487,4 +1487,103 @@ fn the_herdr_socket_follows_the_config_folder_rule_of_herdr() {
     // two inputs through the pure part.
     assert_eq!(remote::herdr_sock_in(Some("/x".into()), "/h".into()), Path::new("/x/herdr/herdr.sock"));
     assert_eq!(remote::herdr_sock_in(None, "/h".into()), Path::new("/h/.config/herdr/herdr.sock"));
+}
+
+// A Workstation core whose Remote has not said `HELLO` yet: the channel is up, but not ready.
+fn late_remote() -> FakeRemote {
+    let root = temp_root("late");
+    let ex = root.join("ex");
+    fs::create_dir_all(&ex).unwrap();
+    let (a, s) = UnixStream::pair().unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let (a2, ex2) = (a.try_clone().unwrap(), ex.clone());
+    let ws = Some(std::thread::spawn(move || exchange::channel(a2, a, &ex2, "test-host", || {}, |_| {})));
+    FakeRemote { root, ex, s, ws, last_ls: 1000 }
+}
+
+// The `HELLO` of the Remote, with `proto` as its protocol integer.
+fn say_hello(r: &mut FakeRemote, proto: &str) {
+    r.s.write_all(MAGIC).unwrap();
+    r.s.write_all(&frame(0, HELLO, format!("{proto}\t0\tremote").as_bytes())).unwrap();
+    let mut m = [0u8; 8];
+    r.s.read_exact(&mut m).unwrap();
+    assert_eq!(read_frame(&mut r.s).unwrap().1, HELLO);
+}
+
+// A press of one 3-byte file on its own thread. `connects` counts the calls of its `connect`.
+fn late_press(ex: &Path, name: &str, wait: Duration, connects: &Arc<AtomicU32>) -> JoinHandle<Outcome> {
+    let (ex, name, n) = (ex.to_path_buf(), name.to_string(), connects.clone());
+    std::thread::spawn(move || {
+        exchange::press(&ex, &[Item::mem(&name, b"abc".to_vec())], wait, move || { n.fetch_add(1, SeqCst); }, |_| panic!("clipboard"))
+    })
+}
+
+#[test]
+fn a_press_with_no_channel_connects_and_sends_its_copy_at_the_matching_hello() {
+    let mut r = late_remote();
+    let connects = Arc::new(AtomicU32::new(0));
+    let h = late_press(&r.ex, "a.png", Duration::from_secs(5), &connects);
+    wait_for("connect", || connects.load(SeqCst) == 1);
+    assert!(!exchange::connected(&r.ex));
+    say_hello(&mut r, PROTO);
+    assert_eq!(r.next(), (1, OPEN, b"hotkey\t1\ta.png\t3".to_vec()));
+    assert_eq!(r.next(), (1, DATA, b"abc".to_vec()));
+    r.send(1, END, b"0\tpasted");
+    assert_eq!(h.join().unwrap(), Outcome::Pasted);
+    assert_eq!(connects.load(SeqCst), 1);
+}
+
+#[test]
+fn a_press_connects_only_when_no_channel_is_up() {
+    let r = FakeRemote::start();
+    wait_for("channel", || exchange::connected(&r.ex));
+    exchange::start_connect(&r.ex, || panic!("a channel is up"));
+    let off = late_remote();
+    let mut n = 0;
+    exchange::start_connect(&off.ex, || n += 1);
+    assert_eq!(n, 1);
+}
+
+#[test]
+fn a_press_with_no_hello_in_time_gives_the_error_sound_and_drops_its_copy() {
+    use crate::sounds::Sound::Error;
+    let mut r = late_remote();
+    let connects = Arc::new(AtomicU32::new(0));
+    let before = asked(Error);
+    let out = late_press(&r.ex, "a.png", Duration::from_millis(200), &connects).join().unwrap();
+    assert!(matches!(&out, Outcome::Failed(w) if w.contains("no HELLO")), "{out:?}");
+    assert!(asked(Error) > before);
+    // The HELLO comes late: the old copy is not sent.
+    say_hello(&mut r, PROTO);
+    r.quiet();
+}
+
+#[test]
+fn a_mismatched_hello_does_not_send_the_copy() {
+    let mut r = late_remote();
+    let connects = Arc::new(AtomicU32::new(0));
+    let h = late_press(&r.ex, "a.png", Duration::from_millis(300), &connects);
+    wait_for("connect", || connects.load(SeqCst) == 1);
+    say_hello(&mut r, "1");
+    assert!(r.ended().unwrap().starts_with("version mismatch"));
+    assert!(matches!(h.join().unwrap(), Outcome::Failed(_)));
+    assert!(!exchange::connected(&r.ex));
+    assert!(read_frame(&mut r.s).is_err(), "no frame comes after the mismatch");
+}
+
+#[test]
+fn a_newer_press_takes_over_from_one_that_waits_and_only_its_copy_is_sent() {
+    let mut r = late_remote();
+    let connects = Arc::new(AtomicU32::new(0));
+    let old = late_press(&r.ex, "old.png", Duration::from_secs(5), &connects);
+    wait_for("first connect", || connects.load(SeqCst) == 1);
+    let new = late_press(&r.ex, "new.png", Duration::from_secs(5), &connects);
+    // The old press returns when the new one has registered, long before its own limit.
+    assert_eq!(old.join().unwrap(), Outcome::Superseded);
+    say_hello(&mut r, PROTO);
+    assert_eq!(r.next(), (1, OPEN, b"hotkey\t1\tnew.png\t3".to_vec()));
+    assert_eq!(r.next().1, DATA);
+    r.send(1, END, b"0\tpasted");
+    assert_eq!(new.join().unwrap(), Outcome::Pasted);
+    r.quiet();
 }
