@@ -302,6 +302,8 @@ fn from_workstation(s: &S, mut r: impl Read) {
                     let _ = c.write_all(&frame(id, END, &p));
                 }
             }
+            // A CANCEL closes a stream that the Workstation opened. `serve` holds none, so the frame is dropped.
+            CANCEL => {}
             BYE => return quit(s, &format!("BYE {}", String::from_utf8_lossy(&p))),
             k => s.log(&format!("unknown frame kind {k} on {id}")),
         }
@@ -344,7 +346,7 @@ fn from_agent(s: &S, mut c: UnixStream) {
     s.log(&format!("stream {id}: {}", String::from_utf8_lossy(&open).replace('\t', " ")));
     loop {
         match read_frame(&mut c) {
-            Ok((_, DATA, d)) => {
+            Ok((1, DATA, d)) => {
                 let live = s.peers.lock().unwrap().contains_key(&id);
                 if live {
                     s.out.stream(id, DATA, &d);

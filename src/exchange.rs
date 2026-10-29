@@ -12,7 +12,7 @@ use crate::sounds::{play, Sound};
 use crate::windows::{hide, log, ssh};
 #[cfg(not(windows))]
 use crate::stub::log;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
@@ -23,6 +23,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const PREV: &str = ".ferry-prev";
+const PART: &str = ".ferry-part";
 
 struct Push {
     tmp: PathBuf,
@@ -39,7 +40,26 @@ struct C {
     ex: PathBuf,
     rx_ms: AtomicU64,
     pushes: Mutex<HashMap<u32, Push>>,
-    cancelled: Mutex<HashSet<u32>>,
+    // The streams that this side answers (`ls`, `pull`), each with a flag for a CANCEL from the opener.
+    answering: Mutex<HashMap<u32, bool>>,
+}
+
+impl C {
+    // True when the opener cancelled the stream: the answer sends no more frames.
+    fn cancelled(&self, id: u32) -> bool {
+        self.answering.lock().unwrap().get(&id) == Some(&true)
+    }
+}
+
+// The start of `ferry run`: makes the Exchange folder with `.ferry-prev\` and `.ferry-part\`,
+// and deletes what an earlier run left in `.ferry-part\`.
+pub fn prepare(ex: &Path) -> io::Result<()> {
+    fs::create_dir_all(ex.join(PREV))?;
+    let part = ex.join(PART);
+    if part.exists() {
+        fs::remove_dir_all(&part)?;
+    }
+    fs::create_dir_all(part)
 }
 
 #[cfg(windows)]
@@ -47,8 +67,9 @@ pub fn run(alias: &str) {
     let remote = "~/.local/bin/ferry serve";
     let host = std::env::var("COMPUTERNAME").unwrap_or_default();
     let ex = PathBuf::from(std::env::var("USERPROFILE").expect("USERPROFILE is not set")).join("ferry");
-    fs::create_dir_all(ex.join(PREV)).unwrap();
+    prepare(&ex).unwrap();
     hide(&ex.join(PREV));
+    hide(&ex.join(PART));
     log(&format!("Exchange folder {}, host {host}", ex.display()));
 
     loop {
@@ -100,7 +121,7 @@ pub fn channel(mut stdin: impl Write + Send + 'static, r: impl Read, ex: &Path, 
         ex: ex.to_path_buf(),
         rx_ms: AtomicU64::new(now_ms()),
         pushes: Mutex::default(),
-        cancelled: Mutex::default(),
+        answering: Mutex::default(),
     });
     c.out.ctrl(0, HELLO, format!("{PROTO}\t{VERSION}\t{host}").as_bytes());
     let c2 = c.clone();
@@ -126,8 +147,7 @@ pub fn channel(mut stdin: impl Write + Send + 'static, r: impl Read, ex: &Path, 
     let why = session(&c, &mut r);
     c.out.kill();
     for (_, p) in c.pushes.lock().unwrap().drain() {
-        drop(p.file);
-        let _ = fs::remove_file(&p.tmp);
+        discard(p);
     }
     Ok(why)
 }
@@ -163,13 +183,14 @@ fn session(c: &Arc<C>, r: &mut impl BufRead) -> String {
             DATA => data(c, id, &p),
             CANCEL => {
                 if let Some(p) = c.pushes.lock().unwrap().remove(&id) {
-                    drop(p.file);
-                    let _ = fs::remove_file(&p.tmp);
+                    discard(p);
                     log(&format!("{id}: CANCEL, part file deleted"));
-                } else {
-                    c.cancelled.lock().unwrap().insert(id);
-                }
+                } else if let Some(x) = c.answering.lock().unwrap().get_mut(&id) {
+                    *x = true;
+                } // else: the stream is closed or unknown, and the frame is dropped
             }
+            // The Workstation opens no request that an END could close.
+            END => {}
             BYE => return String::from_utf8_lossy(&p).to_string(),
             k => log(&format!("{id}: unknown frame kind {k}")),
         }
@@ -177,6 +198,9 @@ fn session(c: &Arc<C>, r: &mut impl BufRead) -> String {
 }
 
 fn reply(c: &C, id: u32, code: u8, msg: &str) {
+    if c.cancelled(id) {
+        return log(&format!("{id}: cancelled, no END"));
+    }
     log(&format!("{id}: END {code} {msg}"));
     c.out.stream(id, END, &end(code, msg));
 }
@@ -219,12 +243,8 @@ fn open(c: &Arc<C>, id: u32, f: Vec<String>) {
     };
     let c = c.clone();
     match f[0].as_str() {
-        "ls" => {
-            std::thread::spawn(move || ls(&c, id, &path));
-        }
-        "pull" => {
-            std::thread::spawn(move || pull(&c, id, &path));
-        }
+        "ls" => answer(&c, id, move |c| ls(c, id, &path)),
+        "pull" => answer(&c, id, move |c| pull(c, id, &path)),
         "push" => {
             let size: u64 = f.get(2).and_then(|s| s.parse().ok()).unwrap_or(0);
             if size > CAP {
@@ -235,10 +255,10 @@ fn open(c: &Arc<C>, id: u32, f: Vec<String>) {
             }
             let dir = path.parent().unwrap();
             let name = path.file_name().unwrap().to_string_lossy().to_string();
-            if let Err(e) = fs::create_dir_all(dir) {
+            if let Err(e) = fs::create_dir_all(dir).and_then(|_| fs::create_dir_all(c.ex.join(PART))) {
                 return reply(&c, id, 1, &e.to_string());
             }
-            let tmp = dir.join(format!(".ferry-part-{id}-{name}"));
+            let tmp = c.ex.join(PART).join(format!("{id}-{name}"));
             let file = match File::create(&tmp) {
                 Ok(f) => f,
                 Err(e) => return reply(&c, id, 1, &e.to_string()),
@@ -259,6 +279,16 @@ fn open(c: &Arc<C>, id: u32, f: Vec<String>) {
         }
         op => reply(&c, id, 1, &format!("unknown request {op}")),
     }
+}
+
+// Runs the answer to `id` on its own thread. A CANCEL for `id` stops its END.
+fn answer(c: &Arc<C>, id: u32, f: impl FnOnce(&C) + Send + 'static) {
+    c.answering.lock().unwrap().insert(id, false);
+    let c = c.clone();
+    std::thread::spawn(move || {
+        f(&c);
+        c.answering.lock().unwrap().remove(&id);
+    });
 }
 
 fn ls(c: &C, id: u32, dir: &Path) {
@@ -298,7 +328,7 @@ fn pull(c: &C, id: u32, path: &Path) {
     let t = Instant::now();
     let mut buf = vec![0; CHUNK];
     loop {
-        if c.cancelled.lock().unwrap().remove(&id) {
+        if c.cancelled(id) {
             return log(&format!("{id}: pull cancelled"));
         }
         match f.read(&mut buf) {
@@ -317,19 +347,29 @@ fn pull(c: &C, id: u32, path: &Path) {
 fn data(c: &C, id: u32, d: &[u8]) {
     let mut m = c.pushes.lock().unwrap();
     let Some(p) = m.get_mut(&id) else { return };
-    if let Err(e) = p.file.as_mut().unwrap().write_all(d) {
+    let err = if d.len() as u64 > p.left {
+        Some("more data than declared".to_string())
+    } else {
+        p.file.as_mut().unwrap().write_all(d).err().map(|e| e.to_string())
+    };
+    if let Some(e) = err {
         let p = m.remove(&id).unwrap();
         drop(m);
-        drop(p.file);
-        let _ = fs::remove_file(&p.tmp);
-        return reply(c, id, 1, &e.to_string());
+        discard(p);
+        return reply(c, id, 1, &e);
     }
-    p.left = p.left.saturating_sub(d.len() as u64);
+    p.left -= d.len() as u64;
     if p.left == 0 {
         let p = m.remove(&id).unwrap();
         drop(m);
         finish(c, id, p);
     }
+}
+
+// Closes the part file of a push and deletes it.
+fn discard(p: Push) {
+    drop(p.file);
+    let _ = fs::remove_file(&p.tmp);
 }
 
 fn finish(c: &C, id: u32, mut p: Push) {

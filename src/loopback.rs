@@ -105,19 +105,7 @@ fn bytes(n: usize) -> Vec<u8> {
 }
 
 fn leftovers(l: &Loop) -> Vec<String> {
-    let mut v = Vec::new();
-    let mut dirs = vec![l.ex.clone()];
-    while let Some(d) = dirs.pop() {
-        for e in fs::read_dir(d).unwrap().map(Result::unwrap) {
-            if e.file_name().to_string_lossy().starts_with(".ferry-part") {
-                v.push(e.path().display().to_string());
-            }
-            if e.path().is_dir() {
-                dirs.push(e.path());
-            }
-        }
-    }
-    v
+    parts(&l.ex)
 }
 
 #[test]
@@ -283,4 +271,427 @@ fn takeover_replaces_the_old_serve() {
 fn stale_socket_is_deleted_and_bound_again() {
     let l = Loop::start_with(|state| drop(UnixListener::bind(state.join("ferry.sock")).unwrap()));
     assert_eq!(l.ls("").0, OK);
+}
+
+// ---- stream rules: a scripted peer on one side, the real code on the other ----
+
+use std::io::Read;
+
+fn temp_root(tag: &str) -> PathBuf {
+    static N: AtomicU32 = AtomicU32::new(0);
+    let root = std::env::temp_dir().join(format!("ferry-test-{}-{tag}{}", std::process::id(), N.fetch_add(1, SeqCst)));
+    fs::create_dir_all(&root).unwrap();
+    root
+}
+
+fn wait_for(what: &str, ok: impl Fn() -> bool) {
+    let t = Instant::now();
+    while !ok() {
+        assert!(t.elapsed() < Duration::from_secs(5), "timeout: {what}");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+// The part files in an Exchange folder: all of `.ferry-part`, and each `.ferry-part*` entry elsewhere.
+fn parts(ex: &Path) -> Vec<String> {
+    let part = ex.join(".ferry-part");
+    let (mut v, mut dirs) = (Vec::new(), vec![ex.to_path_buf()]);
+    while let Some(d) = dirs.pop() {
+        for e in fs::read_dir(&d).unwrap().map(Result::unwrap) {
+            let p = e.path();
+            if p != part && (d == part || e.file_name().to_string_lossy().starts_with(".ferry-part")) {
+                v.push(p.display().to_string());
+            }
+            if p.is_dir() {
+                dirs.push(p);
+            }
+        }
+    }
+    v
+}
+
+// A frame header with any length, and no payload.
+fn header(len: usize, id: u32, kind: u8) -> Vec<u8> {
+    let mut h = frame(id, kind, b"");
+    h[..4].copy_from_slice(&(len as u32).to_be_bytes());
+    h
+}
+
+fn end_reply(p: &[u8]) -> Reply {
+    let f = fields(p);
+    (f[0].parse().unwrap(), f[1].clone())
+}
+
+// A scripted Remote on the other end of the Workstation core.
+struct FakeRemote {
+    root: PathBuf,
+    ex: PathBuf,
+    s: UnixStream,
+    ws: Option<JoinHandle<Result<String, String>>>,
+    last_ls: u32,
+}
+
+impl FakeRemote {
+    fn start() -> FakeRemote {
+        let root = temp_root("remote");
+        let ex = root.join("ex");
+        fs::create_dir_all(&ex).unwrap();
+        let (a, mut s) = UnixStream::pair().unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let (a2, ex2) = (a.try_clone().unwrap(), ex.clone());
+        let ws = Some(std::thread::spawn(move || exchange::channel(a2, a, &ex2, "test-host", || {})));
+        s.write_all(MAGIC).unwrap();
+        s.write_all(&frame(0, HELLO, format!("{PROTO}\t0\tremote").as_bytes())).unwrap();
+        let mut m = [0u8; 8];
+        s.read_exact(&mut m).unwrap();
+        assert_eq!(read_frame(&mut s).unwrap().1, HELLO);
+        FakeRemote { root, ex, s, ws, last_ls: 1000 }
+    }
+
+    fn send(&mut self, id: u32, kind: u8, p: &[u8]) {
+        self.s.write_all(&frame(id, kind, p)).unwrap();
+    }
+
+    fn next(&mut self) -> (u32, u8, Vec<u8>) {
+        read_frame(&mut self.s).expect("a frame from the Workstation")
+    }
+
+    // The next frame must be the END of stream `id`.
+    fn end_of(&mut self, id: u32) -> Reply {
+        let (i, kind, p) = self.next();
+        assert_eq!((i, kind), (id, END));
+        end_reply(&p)
+    }
+
+    // No frame comes in reply to a dropped frame. The reply to an `ls` shows it: no other frame comes before.
+    fn quiet(&mut self) {
+        self.last_ls += 2;
+        let id = self.last_ls;
+        self.send(id, OPEN, b"ls\t");
+        loop {
+            let (i, kind, _) = self.next();
+            assert_eq!(i, id, "a frame came for another stream");
+            if kind == END {
+                return;
+            }
+        }
+    }
+
+    // The channel ends when the Workstation core returns.
+    fn ended(&mut self) -> Result<String, String> {
+        self.ws.take().unwrap().join().unwrap()
+    }
+
+    fn part_has(&self, name: &str, data: &[u8]) -> bool {
+        fs::read(self.ex.join(".ferry-part").join(name)).is_ok_and(|d| d == data)
+    }
+}
+
+impl Drop for FakeRemote {
+    fn drop(&mut self) {
+        let _ = self.s.shutdown(std::net::Shutdown::Both);
+        if let Some(h) = self.ws.take() {
+            let _ = h.join();
+        }
+        let _ = fs::remove_dir_all(&self.root);
+    }
+}
+
+#[test]
+fn a_push_completes_at_the_declared_size_with_no_end_from_the_sender() {
+    let mut r = FakeRemote::start();
+    r.send(2, OPEN, b"push\ta.txt\t5");
+    r.send(2, DATA, b"he");
+    wait_for("part file", || r.part_has("2-a.txt", b"he"));
+    assert!(!r.ex.join("a.txt").exists());
+    r.send(2, DATA, b"llo");
+    assert_eq!(r.end_of(2).0, OK);
+    assert_eq!(fs::read(r.ex.join("a.txt")).unwrap(), b"hello");
+    assert!(parts(&r.ex).is_empty());
+
+    // A declared size of 0 completes at OPEN, with no DATA.
+    r.send(4, OPEN, b"push\tz.txt\t0");
+    assert_eq!(r.end_of(4).0, OK);
+    assert_eq!(fs::read(r.ex.join("z.txt")).unwrap(), b"");
+}
+
+#[test]
+fn data_past_the_declared_size_gets_end_1_and_no_file() {
+    let mut r = FakeRemote::start();
+    r.send(2, OPEN, b"push\tbig.bin\t10");
+    r.send(2, DATA, &[7; 20]);
+    let (code, msg) = r.end_of(2);
+    assert_eq!((code, msg.as_str()), (1, "more data than declared"));
+    assert!(!r.ex.join("big.bin").exists());
+    assert!(parts(&r.ex).is_empty());
+
+    // The same when the border of the declared size sits inside the second frame.
+    r.send(4, OPEN, b"push\tbig2.bin\t10");
+    r.send(4, DATA, &[7; 6]);
+    r.send(4, DATA, &[7; 6]);
+    assert_eq!(r.end_of(4).0, 1);
+    assert!(!r.ex.join("big2.bin").exists());
+    assert!(parts(&r.ex).is_empty());
+
+    // The stream is closed now: later frames get no reply.
+    r.send(2, DATA, b"x");
+    r.send(4, CANCEL, b"");
+    r.quiet();
+}
+
+#[test]
+fn the_workstation_drops_frames_for_closed_or_unknown_streams() {
+    let mut r = FakeRemote::start();
+    // Unknown streams.
+    r.send(98, DATA, b"x");
+    r.send(98, END, b"0\t");
+    r.send(98, CANCEL, b"");
+    // A push that completed: its stream is closed.
+    r.send(2, OPEN, b"push\tdone.txt\t2");
+    r.send(2, DATA, b"ab");
+    assert_eq!(r.end_of(2).0, OK);
+    r.send(2, DATA, b"cd");
+    r.send(2, CANCEL, b"");
+    // A push that the Workstation refused at OPEN: its data gets no second reply.
+    r.send(4, OPEN, b"push\t../out.txt\t3");
+    assert_eq!(r.end_of(4).0, BAD_PATH);
+    r.send(4, DATA, b"abc");
+    r.quiet();
+    assert_eq!(fs::read(r.ex.join("done.txt")).unwrap(), b"ab");
+    assert!(!r.root.join("out.txt").exists());
+}
+
+#[test]
+fn cancel_closes_a_push_with_no_reply_and_deletes_the_part_file() {
+    let mut r = FakeRemote::start();
+    r.send(2, OPEN, b"push\tx.bin\t10");
+    r.send(2, DATA, b"abc");
+    wait_for("part file", || r.part_has("2-x.bin", b"abc"));
+    r.send(2, CANCEL, b"");
+    wait_for("part file deleted", || parts(&r.ex).is_empty());
+    r.send(2, DATA, &[7; 7]); // the rest of the data is on the pipe already: dropped
+    r.quiet();
+    assert!(!r.ex.join("x.bin").exists());
+}
+
+#[test]
+fn cancel_stops_the_answer_to_a_pull() {
+    let mut r = FakeRemote::start();
+    fs::write(r.ex.join("big.bin"), bytes(64 * CHUNK)).unwrap();
+    r.send(2, OPEN, b"pull\tbig.bin");
+    assert_eq!(r.next().1, DATA);
+    r.send(2, CANCEL, b"");
+    r.send(4, OPEN, b"ls\t");
+    loop {
+        let (id, kind, _) = r.next();
+        assert!(!(id == 2 && kind == END), "END after CANCEL");
+        if (id, kind) == (4, END) {
+            break;
+        }
+    }
+}
+
+#[test]
+fn a_frame_over_64_kib_ends_the_channel_and_deletes_part_files() {
+    let mut r = FakeRemote::start();
+    r.send(2, OPEN, b"push\tbig.bin\t100");
+    r.send(2, DATA, &[7; 10]);
+    wait_for("part file", || r.part_has("2-big.bin", &[7; 10]));
+    r.s.write_all(&header(CHUNK + 1, 2, DATA)).unwrap();
+    assert!(r.ended().is_ok());
+    assert!(parts(&r.ex).is_empty());
+}
+
+#[test]
+fn the_end_of_the_channel_deletes_part_files() {
+    let mut r = FakeRemote::start();
+    r.send(2, OPEN, b"push\tbig.bin\t100");
+    r.send(2, DATA, &[7; 10]);
+    wait_for("part file", || r.part_has("2-big.bin", &[7; 10]));
+    r.s.shutdown(std::net::Shutdown::Both).unwrap();
+    assert!(r.ended().is_ok());
+    assert!(parts(&r.ex).is_empty());
+    assert!(!r.ex.join("big.bin").exists());
+}
+
+#[test]
+fn the_start_empties_the_part_folder_and_keeps_the_rest() {
+    let root = temp_root("start");
+    let ex = root.join("ex");
+    fs::create_dir_all(ex.join(".ferry-part/sub")).unwrap();
+    fs::write(ex.join(".ferry-part/9-old.bin"), b"x").unwrap();
+    fs::write(ex.join(".ferry-part/sub/old"), b"x").unwrap();
+    fs::create_dir_all(ex.join(".ferry-prev")).unwrap();
+    fs::write(ex.join(".ferry-prev/keep.txt"), b"x").unwrap();
+    fs::write(ex.join("doc.txt"), b"x").unwrap();
+    exchange::prepare(&ex).unwrap();
+    assert!(ex.join(".ferry-part").is_dir());
+    assert!(parts(&ex).is_empty());
+    assert!(ex.join(".ferry-prev/keep.txt").exists() && ex.join("doc.txt").exists());
+    // A first start makes the folders too.
+    let fresh = root.join("fresh");
+    exchange::prepare(&fresh).unwrap();
+    assert!(fresh.join(".ferry-prev").is_dir() && fresh.join(".ferry-part").is_dir());
+    fs::remove_dir_all(root).unwrap();
+}
+
+// A scripted Workstation on the other end of `serve_on`.
+struct FakeWs {
+    root: PathBuf,
+    state: PathBuf,
+    s: UnixStream,
+    serve: Option<JoinHandle<i32>>,
+}
+
+impl FakeWs {
+    fn start() -> FakeWs {
+        let root = temp_root("ws");
+        let state = root.join("state");
+        fs::DirBuilder::new().recursive(true).mode(0o700).create(&state).unwrap();
+        let (mut s, b) = UnixStream::pair().unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let (st, b2) = (state.clone(), b.try_clone().unwrap());
+        let serve = Some(std::thread::spawn(move || remote::serve_on(&st, b, b2, false)));
+        s.write_all(MAGIC).unwrap();
+        s.write_all(&frame(0, HELLO, format!("{PROTO}\t0\tws").as_bytes())).unwrap();
+        let mut m = [0u8; 8];
+        s.read_exact(&mut m).unwrap();
+        assert_eq!(read_frame(&mut s).unwrap().1, HELLO);
+        let w = FakeWs { root, state, s, serve };
+        wait_for("serve socket", || UnixStream::connect(w.state.join("ferry.sock")).is_ok());
+        w
+    }
+
+    fn send(&mut self, id: u32, kind: u8, p: &[u8]) {
+        self.s.write_all(&frame(id, kind, p)).unwrap();
+    }
+
+    fn next(&mut self) -> (u32, u8, Vec<u8>) {
+        read_frame(&mut self.s).expect("a frame from serve")
+    }
+
+    // An agent connection that has said HELLO.
+    fn agent(&self) -> UnixStream {
+        let mut a = UnixStream::connect(self.state.join("ferry.sock")).unwrap();
+        a.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        a.write_all(&remote::greet(PROTO, "cli")).unwrap();
+        a
+    }
+}
+
+impl Drop for FakeWs {
+    fn drop(&mut self) {
+        let _ = self.s.shutdown(std::net::Shutdown::Both);
+        if let Some(h) = self.serve.take() {
+            let _ = h.join();
+        }
+        let _ = fs::remove_dir_all(&self.root);
+    }
+}
+
+// Reads from `a` for a short time and says whether a frame came.
+fn frame_comes(a: &mut UnixStream) -> bool {
+    a.set_read_timeout(Some(Duration::from_millis(200))).unwrap();
+    let r = read_frame(a);
+    a.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    match r {
+        Ok(_) => true,
+        Err(e) => {
+            assert!(matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut), "{e}");
+            false
+        }
+    }
+}
+
+#[test]
+fn serve_accepts_cancel_and_drops_frames_for_closed_or_unknown_streams() {
+    let mut w = FakeWs::start();
+    // Unknown streams, and a CANCEL for a stream that the Workstation could have opened.
+    w.send(4, DATA, b"x");
+    w.send(4, END, b"0\t");
+    w.send(3, CANCEL, b"");
+    w.send(4, CANCEL, b"");
+    let mut a = w.agent();
+    a.write_all(&frame(1, OPEN, b"ls\t")).unwrap();
+    // `serve` sent no frame in reply to the dropped ones: the OPEN is the next frame.
+    assert_eq!(w.next(), (2, OPEN, b"ls\t".to_vec()));
+    w.send(2, DATA, b"row\n");
+    w.send(2, END, b"0\t");
+    assert_eq!(read_frame(&mut a).unwrap(), (2, DATA, b"row\n".to_vec()));
+    assert_eq!(read_frame(&mut a).unwrap().1, END);
+
+    // The stream is closed: frames for it go nowhere, and `serve` still works.
+    w.send(2, DATA, b"late");
+    w.send(2, END, b"1\tlate");
+    w.send(2, CANCEL, b"");
+    let mut b = w.agent();
+    b.write_all(&frame(1, OPEN, b"ls\tb")).unwrap();
+    assert_eq!(w.next(), (4, OPEN, b"ls\tb".to_vec()));
+    assert!(!frame_comes(&mut a));
+    assert!(!frame_comes(&mut b));
+}
+
+#[test]
+fn serve_drops_agent_frames_for_another_stream() {
+    let l = Loop::start();
+    let mut a = sock(&l);
+    a.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    a.write_all(&remote::greet(PROTO, "cli")).unwrap();
+    a.write_all(&frame(1, OPEN, b"push\tx.txt\t3")).unwrap();
+    a.write_all(&frame(7, DATA, b"abc")).unwrap(); // not stream 1: dropped
+    a.write_all(&frame(1, DATA, b"xyz")).unwrap();
+    let (_, kind, p) = read_frame(&mut a).unwrap();
+    assert_eq!((kind, end_reply(&p).0), (END, OK));
+    assert_eq!(fs::read(l.ex.join("x.txt")).unwrap(), b"xyz");
+}
+
+#[test]
+fn a_push_with_extra_data_through_serve_gets_end_1_and_no_file() {
+    let l = Loop::start();
+    let mut a = sock(&l);
+    a.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    a.write_all(&remote::greet(PROTO, "cli")).unwrap();
+    a.write_all(&frame(1, OPEN, b"push\tbig.bin\t10")).unwrap();
+    a.write_all(&frame(1, DATA, &[7; 20])).unwrap();
+    let (_, kind, p) = read_frame(&mut a).unwrap();
+    assert_eq!((kind, end_reply(&p)), (END, (1, "more data than declared".to_string())));
+    assert!(!l.ex.join("big.bin").exists());
+    assert!(leftovers(&l).is_empty());
+}
+
+#[test]
+fn serve_ends_when_the_workstation_sends_a_frame_over_64_kib() {
+    let mut w = FakeWs::start();
+    let mut a = w.agent();
+    a.write_all(&frame(1, OPEN, b"ls\t")).unwrap();
+    assert_eq!(w.next().1, OPEN);
+    w.s.write_all(&header(CHUNK + 1, 2, DATA)).unwrap();
+    assert_eq!(w.serve.take().unwrap().join().unwrap(), 0);
+    // The open request gets END 3.
+    let (_, kind, p) = read_frame(&mut a).unwrap();
+    assert_eq!((kind, end_reply(&p).0), (END, OFFLINE));
+}
+
+#[test]
+fn serve_closes_an_agent_connection_that_sends_a_frame_over_64_kib() {
+    let mut w = FakeWs::start();
+    let mut a = w.agent();
+    a.write_all(&frame(1, OPEN, b"push\tx\t100000")).unwrap();
+    a.write_all(&header(CHUNK + 1, 1, DATA)).unwrap();
+    assert_eq!(w.next(), (2, OPEN, b"push\tx\t100000".to_vec()));
+    assert_eq!(w.next(), (2, CANCEL, Vec::new()));
+    // Closed, not a timeout.
+    assert!(!matches!(read_frame(&mut a).unwrap_err().kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut));
+
+    // The same for the first frame after the magic.
+    let mut b = UnixStream::connect(w.state.join("ferry.sock")).unwrap();
+    b.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    b.write_all(MAGIC).unwrap();
+    b.write_all(&header(CHUNK + 1, 0, HELLO)).unwrap();
+    assert!(!matches!(read_frame(&mut b).unwrap_err().kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut));
+
+    // `serve` goes on.
+    let mut c = w.agent();
+    c.write_all(&frame(1, OPEN, b"ls\t")).unwrap();
+    assert_eq!(w.next().1, OPEN);
 }
