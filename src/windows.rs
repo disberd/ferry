@@ -4,11 +4,12 @@
 //                  start a detached `run` with the same arguments
 //   run <alias> ...  the Exchange folder loop (thread) and the hotkey (main thread)
 //   stop           end the running `run`; its ssh.exe children end with it
-//   status         show version, pid and log path
+//   status         show the state of `run` in five lines; exit 0 when connected
 // State in %LOCALAPPDATA%\ferry\: ferry.log (and ferry.log.1), state (pid,
-// process start time and build version of `run`).
+// process start time and build version of `run`, then its status text).
 
 use crate::lifecycle::{self, Opts, State};
+use crate::link::{self, Link, Report};
 use std::ffi::c_void;
 use std::fs;
 use std::io;
@@ -33,6 +34,7 @@ extern "system" {
     fn CreateJobObjectW(attrs: *mut c_void, name: *const u16) -> *mut c_void;
     fn SetInformationJobObject(job: *mut c_void, class: i32, info: *mut c_void, len: u32) -> i32;
     fn AssignProcessToJobObject(job: *mut c_void, process: *mut c_void) -> i32;
+    fn GetLocalTime(t: *mut [u16; 8]);
 }
 
 const DETACHED_PROCESS: u32 = 0x8;
@@ -72,13 +74,29 @@ pub fn log(msg: &str) {
     }
 }
 
+// The local time as `HH:MM`.
+fn local_hhmm() -> String {
+    let mut t = [0u16; 8]; // SYSTEMTIME: year, month, weekday, day, hour, minute, second, ms
+    unsafe { GetLocalTime(&mut t) };
+    format!("{:02}:{:02}", t[4], t[5])
+}
+
+// Replaces the state file with the first line of `s` and the report. A reader
+// never sees half a file.
+fn write_state(s: &State, r: &Report) {
+    let (path, tmp) = (dir().join("state"), dir().join("state.tmp"));
+    if let Err(e) = fs::write(&tmp, format!("{}{}", s.text(), r.text())).and_then(|_| fs::rename(&tmp, &path)) {
+        log(&format!("FAIL: write state file: {e}"));
+    }
+}
+
 // Hidden ssh.exe with the Remote command; piped stdio. It runs in the Job
 // object of `ferry run`, so it ends when `ferry run` ends, however that happens.
 pub fn ssh(alias: &str, remote: &str) -> io::Result<Child> {
     let system_ssh = r"C:\Windows\System32\OpenSSH\ssh.exe";
     let ssh = if std::path::Path::new(system_ssh).exists() { system_ssh } else { "ssh.exe" };
     let mut c = Command::new(ssh);
-    c.args(["-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15", "-o", "ServerAliveInterval=15", alias, remote]);
+    c.args(["-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15", "-o", "ServerAliveInterval=15", "-o", "ClearAllForwardings=yes", "-o", "RemoteCommand=none", alias, remote]);
     c.creation_flags(CREATE_NO_WINDOW).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
     let child = c.spawn()?;
     in_job(&child);
@@ -201,8 +219,12 @@ pub fn run(o: &Opts) -> i32 {
     }
     let exe = std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_default();
     log(&format!("ferry {} run {} exe {exe}, hotkey {}, apps {}", crate::frame::VERSION, o.alias, o.hotkey, o.apps.join(",")));
+    let link = Link::new(&o.alias, &format!("{} for {}", o.hotkey, o.apps.join(", ")), local_hhmm, move |r| {
+        log(&format!("channel: {}", r.channel));
+        write_state(&s, r);
+    });
     let a = o.alias.clone();
-    std::thread::spawn(move || crate::exchange::run(&a));
+    std::thread::spawn(move || crate::exchange::run(&a, &link));
     crate::hotkey::run(o);
     // No hotkey: the Exchange folder loop keeps the process alive.
     loop {
@@ -228,15 +250,10 @@ pub fn stop() -> i32 {
 }
 
 pub fn status() -> i32 {
-    println!("ferry {}", crate::frame::VERSION);
-    let pid = saved_process().map(|(s, h)| {
-        unsafe { CloseHandle(h) };
-        s.pid
-    });
-    match pid {
-        Some(p) => println!("run: pid {p}"),
-        None => println!("run: not running"),
-    }
-    println!("log: {}", dir().join("ferry.log").display());
-    i32::from(pid.is_none())
+    let text = fs::read_to_string(dir().join("state")).unwrap_or_default();
+    let running = saved_process().map(|(_, h)| unsafe { CloseHandle(h) }).is_some();
+    let report = text.split_once('\n').and_then(|(_, rest)| Report::parse(rest));
+    let (out, code) = link::status_text(crate::frame::VERSION, State::parse(&text).as_ref(), running, report.as_ref(), &dir().join("ferry.log").display().to_string());
+    print!("{out}");
+    code
 }

@@ -9,6 +9,8 @@
 use crate::frame::*;
 use crate::sounds::{play, Sound};
 #[cfg(windows)]
+use crate::link::Link;
+#[cfg(windows)]
 use crate::windows::{hide, log, ssh};
 #[cfg(not(windows))]
 use crate::stub::log;
@@ -63,7 +65,7 @@ pub fn prepare(ex: &Path) -> io::Result<()> {
 }
 
 #[cfg(windows)]
-pub fn run(alias: &str) {
+pub fn run(alias: &str, link: &Link) {
     let remote = "~/.local/bin/ferry serve";
     let host = std::env::var("COMPUTERNAME").unwrap_or_default();
     let ex = PathBuf::from(std::env::var("USERPROFILE").expect("USERPROFILE is not set")).join("ferry");
@@ -73,31 +75,34 @@ pub fn run(alias: &str) {
     log(&format!("Exchange folder {}, host {host}", ex.display()));
 
     loop {
+        link.connecting();
         log(&format!("connect: {alias} {remote}"));
-        let why = match connect(alias, remote, &host, &ex) {
+        let last = Arc::new(Mutex::new(String::new()));
+        let why = match connect(alias, remote, &host, &ex, link, &last) {
             Ok(why) => why,
             Err(e) => format!("FAIL: {e}"),
         };
         log(&format!("connection ended: {why}"));
-        if let Some(by) = why.strip_prefix("replaced\t") {
-            log(&format!("replaced by {by}: exit"));
-            std::process::exit(0);
-        } else {
-            log("reconnect in 5 s");
-            std::thread::sleep(Duration::from_secs(5));
-        }
+        let last = last.lock().unwrap().clone();
+        link.pause(link.ended(&why, &last));
     }
 }
 
 #[cfg(windows)]
-fn connect(alias: &str, remote: &str, host: &str, ex: &Path) -> Result<String, String> {
+fn connect(alias: &str, remote: &str, host: &str, ex: &Path, link: &Link, last: &Arc<Mutex<String>>) -> Result<String, String> {
     let mut child = ssh(alias, remote)
         .map_err(|e| format!("spawn: {e}"))?;
     let stderr = child.stderr.take().unwrap();
+    let (done, drained) = std::sync::mpsc::channel::<()>();
+    let last = last.clone();
     std::thread::spawn(move || {
         for line in BufReader::new(stderr).lines().map_while(Result::ok) {
             log(&format!("ssh: {line}"));
+            if !line.trim().is_empty() {
+                *last.lock().unwrap() = line;
+            }
         }
+        let _ = done.send(());
     });
     let stdin = child.stdin.take().unwrap();
     let stdout = child.stdout.take().unwrap();
@@ -105,15 +110,18 @@ fn connect(alias: &str, remote: &str, host: &str, ex: &Path) -> Result<String, S
     let ch = child.clone();
     let why = channel(stdin, stdout, ex, host, move || {
         let _ = ch.lock().unwrap().kill();
-    });
+    }, |f| link.hello(f));
     let _ = child.lock().unwrap().kill();
     let _ = child.lock().unwrap().wait();
+    // Another process can hold the stderr pipe open, so the wait has a limit.
+    let _ = drained.recv_timeout(Duration::from_secs(1));
     why
 }
 
 // One connection over any byte channel: the pipes of ssh.exe, or a socket pair
-// in the tests. `stop` ends the channel when the Remote goes silent.
-pub fn channel(mut stdin: impl Write + Send + 'static, r: impl Read, ex: &Path, host: &str, stop: impl Fn() + Send + 'static) -> Result<String, String> {
+// in the tests. `stop` ends the channel when the Remote goes silent. `hello`
+// gets the fields of the `HELLO` of the Remote, also when the protocol differs.
+pub fn channel(mut stdin: impl Write + Send + 'static, r: impl Read, ex: &Path, host: &str, stop: impl Fn() + Send + 'static, hello: impl FnOnce(&[String])) -> Result<String, String> {
     let mut r = BufReader::with_capacity(CHUNK + 9, r);
     stdin.write_all(MAGIC).map_err(|e| e.to_string())?;
     let c = Arc::new(C {
@@ -144,7 +152,18 @@ pub fn channel(mut stdin: impl Write + Send + 'static, r: impl Read, ex: &Path, 
         }
     });
 
-    let why = session(&c, &mut r);
+    let why = match crate::link::handshake(&mut r) {
+        Ok(f) => {
+            hello(&f);
+            if f[0] == PROTO {
+                log(&format!("HELLO {}: ready", f.join(" ")));
+                session(&c, &mut r)
+            } else {
+                format!("version mismatch: Workstation {PROTO} ({VERSION}), Remote {} ({})", f[0], f.get(1).map_or("?", String::as_str))
+            }
+        }
+        Err(why) => why,
+    };
     c.out.kill();
     for (_, p) in c.pushes.lock().unwrap().drain() {
         discard(p);
@@ -153,24 +172,6 @@ pub fn channel(mut stdin: impl Write + Send + 'static, r: impl Read, ex: &Path, 
 }
 
 fn session(c: &Arc<C>, r: &mut impl BufRead) -> String {
-    let mut seen = Vec::new();
-    for b in r.by_ref().bytes() {
-        match b {
-            Ok(b) => seen.push(b),
-            Err(e) => return e.to_string(),
-        }
-        if seen.ends_with(MAGIC) || seen.len() > 4096 + 8 {
-            break;
-        }
-    }
-    if !seen.ends_with(MAGIC) {
-        return format!("Remote login prints to stdout: {:?}", String::from_utf8_lossy(&seen[..seen.len().min(80)]));
-    }
-    match read_frame(r) {
-        Ok((_, HELLO, p)) if fields(&p)[0] == PROTO => log(&format!("HELLO {:?}: ready", String::from_utf8_lossy(&p))),
-        Ok((_, _, p)) => return format!("version mismatch: Workstation {PROTO}, Remote {:?}", String::from_utf8_lossy(&p)),
-        Err(e) => return e.to_string(),
-    }
     loop {
         let (id, kind, p) = match read_frame(r) {
             Ok(f) => f,

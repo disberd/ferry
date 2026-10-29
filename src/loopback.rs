@@ -33,7 +33,7 @@ fn pair(state: &Path, ex: &Path, host: &'static str) -> (UnixStream, JoinHandle<
     let b2 = b.try_clone().unwrap();
     let serve = std::thread::spawn(move || remote::serve_on(&st, b, b2, false));
     let a2 = a.try_clone().unwrap();
-    let ws = std::thread::spawn(move || exchange::channel(a2, a, &ex, host, || {}));
+    let ws = std::thread::spawn(move || exchange::channel(a2, a, &ex, host, || {}, |_| {}));
     (channel, serve, ws)
 }
 
@@ -339,7 +339,7 @@ impl FakeRemote {
         let (a, mut s) = UnixStream::pair().unwrap();
         s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         let (a2, ex2) = (a.try_clone().unwrap(), ex.clone());
-        let ws = Some(std::thread::spawn(move || exchange::channel(a2, a, &ex2, "test-host", || {})));
+        let ws = Some(std::thread::spawn(move || exchange::channel(a2, a, &ex2, "test-host", || {}, |_| {})));
         s.write_all(MAGIC).unwrap();
         s.write_all(&frame(0, HELLO, format!("{PROTO}\t0\tremote").as_bytes())).unwrap();
         let mut m = [0u8; 8];
@@ -694,4 +694,60 @@ fn serve_closes_an_agent_connection_that_sends_a_frame_over_64_kib() {
     let mut c = w.agent();
     c.write_all(&frame(1, OPEN, b"ls\t")).unwrap();
     assert_eq!(w.next().1, OPEN);
+}
+
+// The Workstation core against a scripted Remote that sends `script` and then
+// nothing. Returns the state of the link after the connection ended, the wait
+// that `ended` gave, and whether the link was connected in between.
+fn scripted(script: &[u8], stderr_line: &str) -> (crate::link::Chan, Option<u64>, bool) {
+    let (a, mut b) = UnixStream::pair().unwrap();
+    b.write_all(script).unwrap();
+    b.shutdown(std::net::Shutdown::Write).unwrap();
+    let up = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let up2 = up.clone();
+    let link = crate::link::Link::new("alias", "key", || "09:12".into(), move |r| {
+        up2.fetch_or(r.connected, SeqCst);
+    });
+    let a2 = a.try_clone().unwrap();
+    let why = exchange::channel(a2, a, &std::env::temp_dir(), "ws", || {}, |f| link.hello(f)).unwrap();
+    let wait = link.ended(&why, stderr_line);
+    (link.chan(), wait, up.load(SeqCst))
+}
+
+fn remote_says(noise: usize, proto: &str, then: &[u8]) -> Vec<u8> {
+    let mut v = vec![b' '; noise];
+    v.extend(MAGIC);
+    v.extend(frame(0, HELLO, format!("{proto}\t1.2.3\tbox").as_bytes()));
+    v.extend(then);
+    v
+}
+
+#[test]
+fn login_output_up_to_4_kib_before_the_magic_is_skipped() {
+    let bye = frame(0, BYE, b"replaced\tother-host");
+    for noise in [0, 100, 4096] {
+        let (chan, wait, _) = scripted(&remote_says(noise, PROTO, &bye), "");
+        assert_eq!((chan, wait), (crate::link::Chan::Replaced { host: "other-host".into() }, None), "{noise} bytes");
+    }
+    let (chan, ..) = scripted(&remote_says(4097, PROTO, &bye), "");
+    let crate::link::Chan::Offline { detail, .. } = chan else { panic!("{chan:?}") };
+    assert!(detail.starts_with("Remote login prints to stdout"), "{detail}");
+}
+
+#[test]
+fn a_matching_hello_connects_and_a_mismatched_one_does_not() {
+    // The Remote then goes silent for good: the end is a plain channel end.
+    let (chan, wait, up) = scripted(&remote_says(0, PROTO, b""), "");
+    assert!(matches!(chan, crate::link::Chan::Offline { .. }) && wait == Some(5) && up, "{chan:?}");
+    let (chan, wait, up) = scripted(&remote_says(0, "1", b""), "");
+    assert_eq!((chan, wait, up), (crate::link::Chan::Mismatch { remote: "1".into(), wait: 5 }, Some(5), false));
+}
+
+#[test]
+fn ssh_that_ends_before_the_hello_gives_its_last_stderr_line() {
+    for script in [&b""[..], b"banner", MAGIC] {
+        let (chan, ..) = scripted(script, "Permission denied (publickey).");
+        let crate::link::Chan::Offline { detail, .. } = chan else { panic!("{chan:?}") };
+        assert_eq!(detail, "ssh ended before HELLO: Permission denied (publickey).");
+    }
 }

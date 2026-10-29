@@ -8,6 +8,7 @@
 
 mod frame;
 mod lifecycle;
+mod link;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod sounds;
 #[cfg(unix)]
