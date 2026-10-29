@@ -976,7 +976,7 @@ fn a_file_in_use_gives_exit_4_and_stays_as_it_was() {
     assert!(leftovers(&l).is_empty());
 
     // A file that the Workstation cannot open is in use for a pull.
-    fs::set_permissions(sub.join("a.txt"), fs::Permissions::from_mode(0)).unwrap();
+    fs::set_permissions(sub.join("a.txt"), fs::Permissions::from_mode(0o000)).unwrap();
     assert_eq!(l.talk("pull\tsub/a.txt", None).0.unwrap(), (IN_USE, "in use: sub/a.txt".to_string()));
 }
 
