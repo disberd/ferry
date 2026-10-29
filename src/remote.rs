@@ -1,11 +1,12 @@
 // Remote side: the agent commands and `serve`, the child of the hidden
 // ssh.exe of the Workstation.
-// State in ~/.local/state/ferry/ (0700): serve.sock (0600), serve.lock (flock,
+// State in ~/.local/state/ferry/ (0700): ferry.sock (0600), serve.lock (flock,
 // holds the pid), serve.log, in/ (landing folder).
 //
-// The agent socket carries the same frames as the channel. An agent sends OPEN
-// (and DATA for a push) on stream 1. `serve` gives the request an even stream
-// id on the channel and copies the replies back.
+// The helper socket carries the same frames as the channel. Each connection
+// starts with the magic and HELLO (protocol, role). A `cli` agent then sends
+// OPEN (and DATA for a push) on stream 1. `serve` gives the request an even
+// stream id on the channel and copies the replies back.
 
 use crate::frame::*;
 use std::collections::HashMap;
@@ -32,9 +33,16 @@ pub fn base(p: &str) -> &str {
     p.rsplit(['/', '\\']).next().unwrap()
 }
 
+// The start of each helper socket connection: the magic, then HELLO with the
+// protocol integer and the role of the sender (`cli`, `hook` or `serve`).
+pub fn greet(proto: &str, role: &str) -> Vec<u8> {
+    [MAGIC.as_slice(), &frame(0, HELLO, format!("{proto}\t{role}").as_bytes())].concat()
+}
+
 // Err(()) = no `serve` listens: the Workstation is offline.
 pub fn talk(dir: &Path, open: &str, data: Option<File>, out: &mut dyn Write) -> Result<(u8, String), ()> {
-    let mut s = UnixStream::connect(dir.join("serve.sock")).map_err(|_| ())?;
+    let mut s = UnixStream::connect(dir.join("ferry.sock")).map_err(|_| ())?;
+    let _ = s.write_all(&greet(PROTO, "cli"));
     let _ = s.write_all(&frame(1, OPEN, open.as_bytes()));
     if let Some(mut f) = data {
         let mut buf = vec![0; CHUNK];
@@ -156,6 +164,38 @@ fn quit(s: &S, why: &str) {
     s.ended.notify_all();
 }
 
+// Takes `serve.lock` and writes the pid into it. When an older `serve` holds
+// the lock, this asks it to quit over the helper socket (TAKEOVER) and waits
+// `wait` for the lock. If the lock stays held, `kill(pid)` ends the holder.
+// A failed connect means a crash left the socket behind; the caller deletes it.
+fn take_lock(dir: &Path, host: &str, wait: Duration, log: &dyn Fn(&str), kill: &dyn Fn(&str)) -> File {
+    let lockf = OpenOptions::new().create(true).truncate(false).read(true).write(true).open(dir.join("serve.lock")).unwrap();
+    if lockf.try_lock().is_err() {
+        let t = std::time::Instant::now();
+        match UnixStream::connect(dir.join("ferry.sock")) {
+            Ok(mut c) => {
+                let _ = c.write_all(&greet(PROTO, "serve"));
+                let _ = c.write_all(&frame(0, TAKEOVER, host.as_bytes()));
+                log("TAKEOVER sent");
+            }
+            Err(e) => log(&format!("lock held but socket refuses ({e})")),
+        }
+        while lockf.try_lock().is_err() && t.elapsed() < wait {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        if lockf.try_lock().is_err() {
+            let pid = fs::read_to_string(dir.join("serve.lock")).unwrap_or_default();
+            log(&format!("old serve {} still holds the lock after {} s: SIGKILL", pid.trim(), wait.as_secs()));
+            kill(pid.trim());
+            lockf.lock().unwrap();
+        }
+        log(&format!("lock taken after {} ms", t.elapsed().as_millis()));
+    }
+    lockf.set_len(0).unwrap();
+    (&lockf).write_all(std::process::id().to_string().as_bytes()).unwrap();
+    lockf
+}
+
 // `serve` on the stdio of the ssh child. `serve_on` has the details.
 pub fn serve() -> i32 {
     serve_on(&state(), io::stdin(), io::stdout(), true)
@@ -196,31 +236,11 @@ pub fn serve_on(dir: &Path, r: impl Read + Send + 'static, mut w: impl Write + S
     s.log(&format!("HELLO from {host}"));
 
     // Replacement: take the lock from an older `serve`.
-    let lockf = OpenOptions::new().create(true).truncate(false).read(true).write(true).open(dir.join("serve.lock")).unwrap();
-    if lockf.try_lock().is_err() {
-        let t = std::time::Instant::now();
-        match UnixStream::connect(dir.join("serve.sock")) {
-            Ok(mut c) => {
-                let _ = c.write_all(&frame(0, TAKEOVER, host.as_bytes()));
-                s.log("TAKEOVER sent");
-            }
-            Err(e) => s.log(&format!("lock held but socket refuses ({e})")),
-        }
-        while lockf.try_lock().is_err() && t.elapsed() < Duration::from_secs(5) {
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        if lockf.try_lock().is_err() {
-            let pid = fs::read_to_string(dir.join("serve.lock")).unwrap_or_default();
-            s.log(&format!("old serve {} still holds the lock after 5 s: SIGKILL", pid.trim()));
-            let _ = std::process::Command::new("kill").args(["-9", pid.trim()]).status();
-            lockf.lock().unwrap();
-        }
-        s.log(&format!("lock taken after {} ms", t.elapsed().as_millis()));
-    }
-    lockf.set_len(0).unwrap();
-    (&lockf).write_all(std::process::id().to_string().as_bytes()).unwrap();
-    let sock = dir.join("serve.sock");
-    let _ = fs::remove_file(&sock);
+    let _lockf = take_lock(dir, &host, Duration::from_secs(5), &|m| s.log(m), &|pid| {
+        let _ = std::process::Command::new("kill").args(["-9", pid]).status();
+    });
+    let sock = dir.join("ferry.sock");
+    let _ = fs::remove_file(&sock); // a stale socket from a crash, or none
     let listener = UnixListener::bind(&sock).unwrap();
     fs::set_permissions(&sock, fs::Permissions::from_mode(0o600)).unwrap();
 
@@ -285,15 +305,32 @@ fn from_workstation(s: &S, mut r: impl Read) {
 }
 
 fn from_agent(s: &S, mut c: UnixStream) {
-    let Ok((_, kind, p)) = read_frame(&mut c) else { return };
-    if kind == TAKEOVER {
-        let host = String::from_utf8_lossy(&p).to_string();
-        s.out.ctrl(0, BYE, format!("replaced\t{host}").as_bytes());
-        std::thread::sleep(Duration::from_millis(300)); // let the writer send BYE
-        return quit(s, "replaced by a new connection");
-    }
-    if kind != OPEN {
+    let mut m = [0u8; 8];
+    if c.read_exact(&mut m).is_err() || m != *MAGIC {
         return;
+    }
+    let Ok((_, HELLO, p)) = read_frame(&mut c) else { return };
+    let f = fields(&p);
+    let role = f.get(1).map_or("", String::as_str);
+    if f[0] != PROTO {
+        let why = format!("ferry serve speaks protocol {PROTO}, this ferry {}", f[0]);
+        if role == "hook" {
+            s.log(&why); // a hook reads no reply
+        } else {
+            let _ = c.write_all(&frame(0, END, &end(1, &why)));
+        }
+        return;
+    }
+    let Ok((_, kind, p)) = read_frame(&mut c) else { return };
+    match (role, kind) {
+        ("serve", TAKEOVER) => {
+            let host = String::from_utf8_lossy(&p).to_string();
+            s.out.ctrl(0, BYE, format!("replaced\t{host}").as_bytes());
+            std::thread::sleep(Duration::from_millis(300)); // let the writer send BYE
+            return quit(s, "replaced by a new connection");
+        }
+        ("cli", OPEN) => {}
+        _ => return,
     }
     let open = p;
     let id = s.next.fetch_add(2, SeqCst);
@@ -320,5 +357,49 @@ fn from_agent(s: &S, mut c: UnixStream) {
                 return;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::RefCell;
+
+    // A folder with `serve.lock` held by this test, as an older `serve` would.
+    fn held_lock(name: &str) -> (PathBuf, File) {
+        let d = std::env::temp_dir().join(format!("ferry-test-{}-{name}", std::process::id()));
+        fs::create_dir_all(&d).unwrap();
+        let held = OpenOptions::new().create(true).truncate(false).write(true).open(d.join("serve.lock")).unwrap();
+        held.lock().unwrap();
+        (&held).write_all(b"4242").unwrap();
+        (d, held)
+    }
+
+    // The holder ignores TAKEOVER (here the socket is stale, so the connect fails):
+    // after the wait, the injected `kill` gets the pid from the lock file. No real process gets a signal.
+    #[test]
+    fn a_holder_that_stays_is_killed_after_the_wait() {
+        let (d, held) = held_lock("kill");
+        drop(UnixListener::bind(d.join("ferry.sock")).unwrap());
+        let killed = RefCell::new(None);
+        let lockf = take_lock(&d, "h", Duration::from_millis(100), &|_| {}, &|pid| {
+            *killed.borrow_mut() = Some(pid.to_string());
+            held.unlock().unwrap();
+        });
+        assert_eq!(killed.into_inner().as_deref(), Some("4242"));
+        drop(lockf);
+        assert_eq!(fs::read_to_string(d.join("serve.lock")).unwrap(), std::process::id().to_string());
+        fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn a_holder_that_quits_in_time_is_not_killed() {
+        let (d, held) = held_lock("quit");
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            held.unlock().unwrap();
+        });
+        take_lock(&d, "h", Duration::from_secs(5), &|_| {}, &|_| panic!("killed a holder that quit"));
+        fs::remove_dir_all(d).unwrap();
     }
 }

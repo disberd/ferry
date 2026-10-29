@@ -6,9 +6,10 @@
 use crate::frame::*;
 use crate::{exchange, remote};
 use std::fs;
-use std::os::unix::fs::DirBuilderExt;
-use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
+use std::io::Write;
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering::SeqCst};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -24,22 +25,35 @@ struct Loop {
     ws: Option<JoinHandle<Result<String, String>>>,
 }
 
+// The Workstation core and one `serve` on a socket pair.
+fn pair(state: &Path, ex: &Path, host: &'static str) -> (UnixStream, JoinHandle<i32>, JoinHandle<Result<String, String>>) {
+    let (a, b) = UnixStream::pair().unwrap();
+    let channel = a.try_clone().unwrap();
+    let (st, ex) = (state.to_path_buf(), ex.to_path_buf());
+    let b2 = b.try_clone().unwrap();
+    let serve = std::thread::spawn(move || remote::serve_on(&st, b, b2, false));
+    let a2 = a.try_clone().unwrap();
+    let ws = std::thread::spawn(move || exchange::channel(a2, a, &ex, host, || {}));
+    (channel, serve, ws)
+}
+
 impl Loop {
     fn start() -> Loop {
+        Loop::start_with(|_| {})
+    }
+
+    // `prep` runs on the state folder before `serve` starts.
+    fn start_with(prep: impl FnOnce(&Path)) -> Loop {
         static N: AtomicU32 = AtomicU32::new(0);
         let root = std::env::temp_dir().join(format!("ferry-test-{}-{}", std::process::id(), N.fetch_add(1, SeqCst)));
         let (ex, state) = (root.join("ex"), root.join("state"));
         fs::create_dir_all(&ex).unwrap();
         fs::DirBuilder::new().recursive(true).mode(0o700).create(&state).unwrap();
-        let (a, b) = UnixStream::pair().unwrap();
-        let channel = a.try_clone().unwrap();
-        let (st, ex2) = (state.clone(), ex.clone());
-        let b2 = b.try_clone().unwrap();
-        let serve = std::thread::spawn(move || remote::serve_on(&st, b, b2, false));
-        let a2 = a.try_clone().unwrap();
-        let ws = std::thread::spawn(move || exchange::channel(a2, a, &ex2, "test-host", || {}));
+        prep(&state);
+        let (channel, serve, ws) = pair(&state, &ex, "test-host");
+        // A stale socket file can exist already, so wait for a connect, not for the file.
         let t = Instant::now();
-        while !state.join("serve.sock").exists() {
+        while UnixStream::connect(state.join("ferry.sock")).is_err() {
             assert!(t.elapsed() < Duration::from_secs(5), "serve did not start");
             std::thread::sleep(Duration::from_millis(10));
         }
@@ -183,4 +197,90 @@ fn end_of_channel_ends_serve() {
     let mut l = Loop::start();
     assert_eq!(l.push("a.txt", b"x").0, OK);
     assert_eq!(l.stop(), Some(0));
+}
+
+#[test]
+fn matching_protocol_takes_the_lock_and_serves() {
+    let l = Loop::start();
+    let pid = fs::read_to_string(l.state.join("serve.lock")).unwrap();
+    assert_eq!(pid, std::process::id().to_string());
+    let mode = fs::metadata(l.state.join("ferry.sock")).unwrap().permissions().mode();
+    assert_eq!(mode & 0o777, 0o600);
+    assert_eq!(l.ls("").0, OK);
+}
+
+// A second Workstation with another protocol integer must not stop the
+// running `serve`: the new `serve` exits before it takes the lock.
+#[test]
+fn channel_mismatch_leaves_the_running_serve_alone() {
+    let l = Loop::start();
+    let (mut ws, b) = UnixStream::pair().unwrap();
+    let (st, b2) = (l.state.clone(), b.try_clone().unwrap());
+    let serve = std::thread::spawn(move || remote::serve_on(&st, b, b2, false));
+    ws.write_all(MAGIC).unwrap();
+    ws.write_all(&frame(0, HELLO, b"1\t0.0.1\told-host")).unwrap();
+    assert_eq!(serve.join().unwrap(), 1);
+    assert_eq!(l.ls("").0, OK);
+}
+
+fn sock(l: &Loop) -> UnixStream {
+    UnixStream::connect(l.state.join("ferry.sock")).unwrap()
+}
+
+#[test]
+fn socket_mismatch_gets_end_1_and_a_hook_gets_a_log_line() {
+    let l = Loop::start();
+    let mut c = sock(&l);
+    c.write_all(&remote::greet("1", "cli")).unwrap();
+    let (_, kind, p) = read_frame(&mut c).unwrap();
+    assert_eq!(kind, END);
+    assert_eq!(fields(&p), ["1", &format!("ferry serve speaks protocol {PROTO}, this ferry 1")]);
+
+    // A hook reads no reply: the connection just closes.
+    let mut c = sock(&l);
+    c.write_all(&remote::greet("1", "hook")).unwrap();
+    assert!(read_frame(&mut c).is_err());
+    assert!(fs::read_to_string(l.state.join("serve.log")).unwrap().contains("this ferry 1"));
+    assert_eq!(l.ls("").0, OK);
+}
+
+#[test]
+fn takeover_with_another_protocol_is_refused() {
+    let l = Loop::start();
+    let mut c = sock(&l);
+    c.write_all(&remote::greet("1", "serve")).unwrap();
+    c.write_all(&frame(0, TAKEOVER, b"other-host")).unwrap();
+    let (_, kind, p) = read_frame(&mut c).unwrap();
+    assert_eq!((kind, fields(&p)[0].as_str()), (END, "1"));
+    assert_eq!(l.ls("").0, OK); // no BYE: the old `serve` stays
+}
+
+#[test]
+fn takeover_replaces_the_old_serve() {
+    let mut l = Loop::start();
+    let sock = l.state.join("ferry.sock");
+    let old = fs::metadata(&sock).unwrap().ino();
+    let (ch2, serve2, ws2) = pair(&l.state, &l.ex, "new-host");
+
+    // The old Workstation gets BYE with the host of the new one, then the old `serve` ends.
+    let bye = l.ws.take().unwrap().join().unwrap().unwrap();
+    assert!(bye.contains("new-host"), "{bye}");
+    assert_eq!(l.serve.take().unwrap().join().unwrap(), 0);
+
+    // The new `serve` binds a new socket file, then it serves.
+    let t = Instant::now();
+    while fs::metadata(&sock).map(|m| m.ino()).unwrap_or(old) == old {
+        assert!(t.elapsed() < Duration::from_secs(5), "new serve did not bind");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(l.ls("").0, OK);
+    ch2.shutdown(std::net::Shutdown::Both).unwrap();
+    ws2.join().unwrap().unwrap();
+    assert_eq!(serve2.join().unwrap(), 0);
+}
+
+#[test]
+fn stale_socket_is_deleted_and_bound_again() {
+    let l = Loop::start_with(|state| drop(UnixListener::bind(state.join("ferry.sock")).unwrap()));
+    assert_eq!(l.ls("").0, OK);
 }

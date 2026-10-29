@@ -13,7 +13,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const MAGIC: &[u8; 8] = b"\0FERRY\r\n";
-pub const PROTO: &str = "1";
+pub const PROTO: &str = "2";
 pub const CHUNK: usize = 64 * 1024;
 pub const CAP: u64 = 512 << 20; // largest single transfer
 pub const PING_S: u64 = 15;
