@@ -130,7 +130,9 @@ fn connect(alias: &str, remote: &str, host: &str, ex: &Path, link: &Link, last: 
 // `herdr` gets the fields of each `HERDR` frame and says whether the error sound is due.
 pub fn channel(mut stdin: impl Write + Send + 'static, r: impl Read, ex: &Path, host: &str, stop: impl Fn() + Send + 'static, hello: impl FnOnce(&[String]), herdr: impl Fn(&[String]) -> bool) -> Result<String, String> {
     let mut r = BufReader::with_capacity(CHUNK + 9, r);
-    stdin.write_all(MAGIC).map_err(|e| e.to_string())?;
+    // MAGIC and HELLO go out at once, not through the queue of `Out`: a mismatched
+    // HELLO of the Remote ends the channel, and the Remote must still get ours.
+    stdin.write_all(&[MAGIC.as_slice(), &frame(0, HELLO, format!("{PROTO}\t{VERSION}\t{host}").as_bytes())].concat()).map_err(|e| e.to_string())?;
     let c = Arc::new(C {
         out: Out::default(),
         ex: ex.to_path_buf(),
@@ -141,7 +143,6 @@ pub fn channel(mut stdin: impl Write + Send + 'static, r: impl Read, ex: &Path, 
         press_ended: Condvar::new(),
         press_next: AtomicU32::new(1),
     });
-    c.out.ctrl(0, HELLO, format!("{PROTO}\t{VERSION}\t{host}").as_bytes());
     let c2 = c.clone();
     std::thread::spawn(move || c2.out.run(stdin));
     let c2 = c.clone();
